@@ -65,6 +65,22 @@ pub enum AppError {
     #[error("No Codeberg credential found for host '{0}'.\nRun: cbpkg auth login")]
     CredentialMissing(String),
 
+    #[error(
+        "A Codeberg credential is already stored for {host} as '{username}'.\nRun `cbpkg auth logout` before signing in with another credential."
+    )]
+    CredentialAlreadyExists { host: String, username: String },
+
+    #[error(
+        "Multiple cbpkg credentials were found for {0}.\nRun `cbpkg auth logout` to clear them, then log in again."
+    )]
+    DuplicateCredentials(String),
+
+    #[error("Credential for host '{0}' is malformed: missing 'username' attribute")]
+    MalformedCredential(String),
+
+    #[error("HTTP client initialization failed: {0}")]
+    HttpClientInit(String),
+
     #[error("Codeberg authentication rejected: invalid username or token")]
     AuthenticationRejected,
 

@@ -7,7 +7,7 @@ use cbpkg::makepkg::{
 };
 use cbpkg::package::{validate_built_package, validate_planned_package};
 use cbpkg::profile::{BuildProfile, TargetProfile};
-use cbpkg::secret::{CredentialStore, SecretServiceStore};
+use cbpkg::secret::{CredentialState, CredentialStore, SecretServiceStore, normalize_host};
 use clap::{CommandFactory, Parser};
 use std::io::{self, BufRead, Write};
 
@@ -36,6 +36,19 @@ fn handle_auth(args: AuthArgs) -> Result<(), AppError> {
 
     match args.command {
         AuthCommand::Login { host, username } => {
+            let host = normalize_host(&host)?;
+
+            // Invariant: single-account-per-host. Refuse if credential already exists.
+            match store.lookup_credential(&host)? {
+                CredentialState::Present { username } => {
+                    return Err(AppError::CredentialAlreadyExists { host, username });
+                }
+                CredentialState::Duplicate { .. } => {
+                    return Err(AppError::DuplicateCredentials(host));
+                }
+                CredentialState::Missing => {}
+            }
+
             let username = match username {
                 Some(u) if !u.trim().is_empty() => u.trim().to_string(),
                 _ => {
@@ -61,7 +74,7 @@ fn handle_auth(args: AuthArgs) -> Result<(), AppError> {
             }
 
             println!("\x1b[1;34m==>\x1b[0m Verifying token with {host}...");
-            let client = CodebergClient::new();
+            let client = CodebergClient::new()?;
             client.verify_token(&host, &username, token)?;
 
             println!("\x1b[1;34m==>\x1b[0m Storing credential in Secret Service...");
@@ -73,6 +86,7 @@ fn handle_auth(args: AuthArgs) -> Result<(), AppError> {
             Ok(())
         }
         AuthCommand::Logout { host } => {
+            let host = normalize_host(&host)?;
             if store.delete_credential(&host)? {
                 println!("\x1b[1;32m==>\x1b[0m Removed Codeberg credential for '{host}'.");
             } else {
@@ -81,14 +95,19 @@ fn handle_auth(args: AuthArgs) -> Result<(), AppError> {
             Ok(())
         }
         AuthCommand::Status { host } => {
-            match store.get_credential(&host)? {
-                Some(cred) => {
+            let host = normalize_host(&host)?;
+            match store.lookup_credential(&host)? {
+                CredentialState::Present { username } => {
                     println!("Codeberg credential: available");
                     println!("Host: {host}");
-                    println!("Username: {}", cred.username);
+                    println!("Username: {username}");
                 }
-                None => {
+                CredentialState::Missing => {
                     println!("Codeberg credential: not configured");
+                    println!("Host: {host}");
+                }
+                CredentialState::Duplicate { .. } => {
+                    return Err(AppError::DuplicateCredentials(host));
                 }
             }
             Ok(())
@@ -123,16 +142,19 @@ fn handle_build(args: BuildArgs) -> Result<(), AppError> {
         validate_host_for_profile(&cpu_provider, profile.as_str())?;
     }
 
-    // Verify authentication BEFORE build if upload is requested
-    let cred_opt = if upload_enabled {
+    let host = normalize_host(&args.host)?;
+
+    // Verify authentication BEFORE build if upload is requested (metadata lookup only; no secret retrieval)
+    if upload_enabled {
         let store = SecretServiceStore::new();
-        match store.get_credential(&args.host)? {
-            Some(cred) => Some(cred),
-            None => return Err(AppError::CredentialMissing(args.host.clone())),
+        match store.lookup_credential(&host)? {
+            CredentialState::Present { .. } => {}
+            CredentialState::Missing => return Err(AppError::CredentialMissing(host.clone())),
+            CredentialState::Duplicate { .. } => {
+                return Err(AppError::DuplicateCredentials(host.clone()));
+            }
         }
-    } else {
-        None
-    };
+    }
 
     let build_options = MakepkgBuildOptions {
         syncdeps: !args.no_syncdeps,
@@ -142,8 +164,7 @@ fn handle_build(args: BuildArgs) -> Result<(), AppError> {
         noconfirm: args.noconfirm,
     };
 
-    let client = CodebergClient::new();
-    let mut upload_errors = Vec::new();
+    let mut packages_to_upload = Vec::new();
 
     for profile in selected_profiles {
         let target = TargetProfile::new(profile, &cpu_provider);
@@ -214,34 +235,12 @@ fn handle_build(args: BuildArgs) -> Result<(), AppError> {
 
             println!("\x1b[1;32m==>\x1b[0m Built {file_name} [arch={arch}]");
 
-            // 9. Optionally upload
-            if upload_enabled && let Some(ref cred) = cred_opt {
-                println!(
-                    "\x1b[1;34m==>\x1b[0m Uploading {file_name} to {}/{}...",
-                    args.owner,
-                    target.codeberg_group()
-                );
-                match client.upload_package(
-                    &args.host,
-                    &args.owner,
-                    target.codeberg_group(),
-                    &cred.username,
-                    &cred.token,
-                    &actual_path,
-                ) {
-                    Ok(UploadStatus::Success(status)) => {
-                        println!("\x1b[1;32m==>\x1b[0m Uploaded: {file_name} (HTTP {status})");
-                    }
-                    Ok(UploadStatus::AlreadyExists(msg)) => {
-                        eprintln!(
-                            "\x1b[1;33m==> WARNING:\x1b[0m Codeberg returned HTTP 409 for {file_name}: {msg}"
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("\x1b[1;31m==> ERROR:\x1b[0m Failed uploading {file_name}: {e}");
-                        upload_errors.push((file_name, e.to_string()));
-                    }
-                }
+            if upload_enabled {
+                packages_to_upload.push((
+                    actual_path,
+                    target.codeberg_group().to_string(),
+                    file_name,
+                ));
             }
         }
 
@@ -249,12 +248,50 @@ fn handle_build(args: BuildArgs) -> Result<(), AppError> {
         println!(
             "  {}",
             pacman_repo_url(
-                &args.host,
+                &host,
                 &args.owner,
                 target.codeberg_group(),
                 target.package_carch()
             )
         );
+    }
+
+    let mut upload_errors = Vec::new();
+    if upload_enabled && !packages_to_upload.is_empty() {
+        println!();
+        println!("\x1b[1;34m==>\x1b[0m Uploading packages to Codeberg...");
+        let store = SecretServiceStore::new();
+        let cred = store.load_credential(&host)?;
+        let client = CodebergClient::new()?;
+
+        for (actual_path, group, file_name) in packages_to_upload {
+            println!(
+                "\x1b[1;34m==>\x1b[0m Uploading {file_name} to {}/{}...",
+                args.owner, group
+            );
+            match client.upload_package(
+                &host,
+                &args.owner,
+                &group,
+                &cred.username,
+                &cred.token,
+                &actual_path,
+            ) {
+                Ok(UploadStatus::Success(status)) => {
+                    println!("\x1b[1;32m==>\x1b[0m Uploaded: {file_name} (HTTP {status})");
+                }
+                Ok(UploadStatus::AlreadyExists(msg)) => {
+                    eprintln!(
+                        "\x1b[1;33m==> WARNING:\x1b[0m Codeberg returned HTTP 409 for {file_name}: {msg}"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("\x1b[1;31m==> ERROR:\x1b[0m Failed uploading {file_name}: {e}");
+                    upload_errors.push((file_name, e.to_string()));
+                }
+            }
+        }
+        drop(cred);
     }
 
     if !upload_errors.is_empty() {

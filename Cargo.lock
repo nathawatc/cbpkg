@@ -283,6 +283,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror",
+ "zeroize",
  "zstd",
 ]
 

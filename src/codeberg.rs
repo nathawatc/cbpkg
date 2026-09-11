@@ -24,23 +24,23 @@ pub struct CodebergClient {
 }
 
 impl CodebergClient {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, AppError> {
         Self::with_options(false)
     }
 
-    fn with_options(allow_insecure_http: bool) -> Self {
+    fn with_options(allow_insecure_http: bool) -> Result<Self, AppError> {
         let client = Client::builder()
             .timeout(Duration::from_secs(300))
             .build()
-            .unwrap_or_else(|_| Client::new());
-        Self {
+            .map_err(|e| AppError::HttpClientInit(e.to_string()))?;
+        Ok(Self {
             client,
             allow_insecure_http,
-        }
+        })
     }
 
     #[cfg(test)]
-    pub fn new_test_client() -> Self {
+    pub(crate) fn new_test_client() -> Result<Self, AppError> {
         Self::with_options(true)
     }
 
@@ -170,12 +170,6 @@ impl CodebergClient {
     }
 }
 
-impl Default for CodebergClient {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 pub fn pacman_repo_url(host: &str, owner: &str, group: &str, arch: &str) -> String {
     let clean_host = host
         .trim()
@@ -188,8 +182,12 @@ pub fn pacman_repo_url(host: &str, owner: &str, group: &str, arch: &str) -> Stri
 pub const MAX_ERROR_BODY_BYTES: usize = 1024;
 pub const MIN_LOOKAHEAD_BYTES: usize = 256;
 pub const MAX_LOOKAHEAD_BYTES: usize = 65536;
+pub const OVERSIZED_TOKEN_SUPPRESSED_MSG: &str = "Server returned an error response; body suppressed because credential length exceeds safe redaction window.";
 
 pub fn read_and_sanitize_response<R: Read>(mut reader: R, token: &str) -> String {
+    if token.len() > MAX_LOOKAHEAD_BYTES {
+        return OVERSIZED_TOKEN_SUPPRESSED_MSG.to_string();
+    }
     let lookahead = if token.is_empty() {
         MIN_LOOKAHEAD_BYTES
     } else {
@@ -206,6 +204,9 @@ pub fn read_and_sanitize_response<R: Read>(mut reader: R, token: &str) -> String
 }
 
 pub fn sanitize_error_bytes(bytes: &[u8], token: &str, stream_had_overflow: bool) -> String {
+    if token.len() > MAX_LOOKAHEAD_BYTES {
+        return OVERSIZED_TOKEN_SUPPRESSED_MSG.to_string();
+    }
     if bytes.is_empty() {
         return "No response body from server".to_string();
     }
@@ -309,7 +310,7 @@ mod tests {
 
     #[test]
     fn test_insecure_http_rejected() {
-        let client = CodebergClient::new();
+        let client = CodebergClient::new().unwrap();
         let res = client.verify_token("http://codeberg.org", "nathawat", "secret_token");
         assert!(
             matches!(res, Err(AppError::InsecureHttpRejected(url)) if url.starts_with("http://"))
@@ -376,9 +377,26 @@ mod tests {
     }
 
     #[test]
+    fn test_codeberg_client_construction_success() {
+        assert!(CodebergClient::new().is_ok());
+        assert!(CodebergClient::new_test_client().is_ok());
+    }
+
+    #[test]
+    fn test_http_client_init_error_display() {
+        let err = AppError::HttpClientInit("builder error test".to_string());
+        let displayed = format!("{err}");
+        assert_eq!(
+            displayed,
+            "HTTP client initialization failed: builder error test"
+        );
+        assert!(!displayed.contains("secret"));
+    }
+
+    #[test]
     fn test_mock_token_verify_success() {
         let (host, handle) = run_mock_server("200 OK", r#"{"login":"nathawat"}"#);
-        let client = CodebergClient::new_test_client();
+        let client = CodebergClient::new_test_client().unwrap();
         let res = client.verify_token(&host, "nathawat", "dummy_token");
         assert!(res.is_ok());
         let _ = handle.join();
@@ -387,7 +405,7 @@ mod tests {
     #[test]
     fn test_mock_token_verify_username_mismatch() {
         let (host, handle) = run_mock_server("200 OK", r#"{"login":"different_user"}"#);
-        let client = CodebergClient::new_test_client();
+        let client = CodebergClient::new_test_client().unwrap();
         let res = client.verify_token(&host, "nathawat", "dummy_token");
         assert!(matches!(res, Err(AppError::TokenVerificationFailed { .. })));
         let _ = handle.join();
@@ -397,7 +415,7 @@ mod tests {
     fn test_mock_token_verify_unauthorized() {
         let (host, handle) =
             run_mock_server("401 Unauthorized", r#"{"message":"bad credentials"}"#);
-        let client = CodebergClient::new_test_client();
+        let client = CodebergClient::new_test_client().unwrap();
         let res = client.verify_token(&host, "nathawat", "bad_token");
         assert!(matches!(res, Err(AppError::AuthenticationRejected)));
         let _ = handle.join();
@@ -410,7 +428,7 @@ mod tests {
         let pkg_file = temp_dir.path().join("pkg-1.0-1-x86_64.pkg.tar.zst");
         std::fs::write(&pkg_file, b"fake package data").unwrap();
 
-        let client = CodebergClient::new_test_client();
+        let client = CodebergClient::new_test_client().unwrap();
         let res = client.upload_package(
             &host,
             "nathawat",
@@ -430,7 +448,7 @@ mod tests {
         let pkg_file = temp_dir.path().join("pkg-1.0-1-x86_64.pkg.tar.zst");
         std::fs::write(&pkg_file, b"fake package data").unwrap();
 
-        let client = CodebergClient::new_test_client();
+        let client = CodebergClient::new_test_client().unwrap();
         let res = client.upload_package(
             &host,
             "nathawat",
@@ -456,7 +474,7 @@ mod tests {
         let pkg_file = temp_dir.path().join("pkg-1.0-1-x86_64.pkg.tar.zst");
         std::fs::write(&pkg_file, b"fake package data").unwrap();
 
-        let client = CodebergClient::new_test_client();
+        let client = CodebergClient::new_test_client().unwrap();
         let res = client.upload_package(
             &host,
             "nathawat",
@@ -480,7 +498,7 @@ mod tests {
         let payload = vec![0xABu8; 1024 * 1024];
         std::fs::write(&pkg_file, &payload).unwrap();
 
-        let client = CodebergClient::new_test_client();
+        let client = CodebergClient::new_test_client().unwrap();
         let res = client.upload_package(
             &host,
             "nathawat",
@@ -694,5 +712,109 @@ mod tests {
         assert!(!sanitized.contains("super_secret_access_token_67890"));
         assert!(sanitized.contains("Authorization: <redacted>"));
         assert!(sanitized.ends_with(" ... [truncated]"));
+    }
+
+    #[test]
+    fn test_oversized_token_length_equals_max_lookahead_bytes() {
+        // Token length exactly at MAX_LOOKAHEAD_BYTES (65536)
+        let token = "T".repeat(MAX_LOOKAHEAD_BYTES);
+        assert_eq!(token.len(), MAX_LOOKAHEAD_BYTES);
+
+        // Starts at offset 1000 in a stream, crossing diagnostic boundary 1024
+        let body = format!("{}{}{}", "A".repeat(1000), token, "B".repeat(100));
+        let sanitized = read_and_sanitize_response(body.as_bytes(), &token);
+
+        // Within lookahead window: properly redacted, NOT completely suppressed
+        assert_ne!(sanitized, OVERSIZED_TOKEN_SUPPRESSED_MSG);
+        assert!(!sanitized.contains(&token));
+        assert!(sanitized.contains("<redacted>"));
+        assert!(sanitized.ends_with(" ... [truncated]"));
+    }
+
+    #[test]
+    fn test_oversized_token_length_equals_max_lookahead_plus_one() {
+        // Token length exactly MAX_LOOKAHEAD_BYTES + 1 (65537)
+        let token = format!("SECRET_PREFIX_{}", "Z".repeat(MAX_LOOKAHEAD_BYTES - 13));
+        assert_eq!(token.len(), MAX_LOOKAHEAD_BYTES + 1);
+
+        let body = format!(
+            "Database error: query timed out. Extra info: {} ... please retry",
+            token
+        );
+        let sanitized = read_and_sanitize_response(body.as_bytes(), &token);
+
+        // Response body content must be completely suppressed
+        assert_eq!(sanitized, OVERSIZED_TOKEN_SUPPRESSED_MSG);
+        assert!(!sanitized.contains("Database error"));
+        assert!(!sanitized.contains("please retry"));
+        // No token bytes or token prefix must be present
+        assert!(!sanitized.contains(&token));
+        assert!(!sanitized.contains("SECRET_PREFIX"));
+        assert!(!sanitized.contains('Z'));
+    }
+
+    #[test]
+    fn test_oversized_token_very_large() {
+        // Very large token (e.g. 200,000 bytes)
+        let token = format!("VERY_LARGE_TOKEN_{}", "K".repeat(200_000));
+        let body = format!("Server failure details: {token}");
+
+        let sanitized = read_and_sanitize_response(body.as_bytes(), &token);
+        assert_eq!(sanitized, OVERSIZED_TOKEN_SUPPRESSED_MSG);
+        assert!(!sanitized.contains("Server failure details"));
+        assert!(!sanitized.contains(&token));
+        assert!(!sanitized.contains("VERY_LARGE_TOKEN"));
+        assert!(!sanitized.contains('K'));
+    }
+
+    #[test]
+    fn test_oversized_token_begins_before_byte_1024() {
+        let token = format!("TOKEN_EARLY_{}", "X".repeat(MAX_LOOKAHEAD_BYTES));
+        assert_eq!(token.len(), MAX_LOOKAHEAD_BYTES + 12);
+
+        // Token begins at byte 500 (before 1024), body has useful text before and after
+        let body = format!(
+            "{}{}{}",
+            "Error line 1: failed auth. ".repeat(15),
+            token,
+            " extra"
+        );
+        let sanitized = read_and_sanitize_response(body.as_bytes(), &token);
+
+        assert_eq!(sanitized, OVERSIZED_TOKEN_SUPPRESSED_MSG);
+        assert!(!sanitized.contains("Error line 1"));
+        assert!(!sanitized.contains("TOKEN_EARLY"));
+        assert!(!sanitized.contains('X'));
+    }
+
+    #[test]
+    fn test_oversized_token_starts_exactly_around_diagnostic_boundary() {
+        let token = format!("BOUNDARY_TOKEN_{}", "Y".repeat(MAX_LOOKAHEAD_BYTES));
+        assert_eq!(token.len(), MAX_LOOKAHEAD_BYTES + 15);
+
+        // Starts exactly at byte 1024
+        let body_at_boundary = format!("{}{}", "A".repeat(1024), token);
+        let sanitized = read_and_sanitize_response(body_at_boundary.as_bytes(), &token);
+        assert_eq!(sanitized, OVERSIZED_TOKEN_SUPPRESSED_MSG);
+        assert!(!sanitized.contains('A'));
+        assert!(!sanitized.contains("BOUNDARY_TOKEN"));
+
+        // Starts at byte 1020 (spans across 1024)
+        let body_crossing = format!("{}{}{}", "B".repeat(1020), token, "C".repeat(50));
+        let sanitized_cross = read_and_sanitize_response(body_crossing.as_bytes(), &token);
+        assert_eq!(sanitized_cross, OVERSIZED_TOKEN_SUPPRESSED_MSG);
+        assert!(!sanitized_cross.contains('B'));
+        assert!(!sanitized_cross.contains("BOUNDARY_TOKEN"));
+    }
+
+    #[test]
+    fn test_oversized_token_with_infinite_stream() {
+        let token = "T".repeat(MAX_LOOKAHEAD_BYTES + 10);
+        let infinite = std::io::repeat(b'W');
+
+        // Bounded memory / execution, does not loop or exhaust memory
+        let sanitized = read_and_sanitize_response(infinite, &token);
+        assert_eq!(sanitized, OVERSIZED_TOKEN_SUPPRESSED_MSG);
+        assert!(!sanitized.contains('W'));
     }
 }
