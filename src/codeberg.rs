@@ -1,7 +1,6 @@
 use crate::error::AppError;
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
-use serde::Deserialize;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -11,11 +10,6 @@ use std::time::Duration;
 pub enum UploadStatus {
     Success(u16),
     AlreadyExists(String),
-}
-
-#[derive(Deserialize)]
-struct UserResponse {
-    login: String,
 }
 
 pub struct CodebergClient {
@@ -60,7 +54,7 @@ impl CodebergClient {
 
     pub fn verify_token(&self, host: &str, username: &str, token: &str) -> Result<(), AppError> {
         let base = self.normalize_endpoint(host)?;
-        let url = format!("{base}/api/v1/user");
+        let url = format!("{base}/api/v1/packages/{username}?limit=1");
         let response = self
             .client
             .get(&url)
@@ -76,34 +70,18 @@ impl CodebergClient {
             return Err(AppError::AuthenticationRejected);
         }
 
+        if status == StatusCode::NOT_FOUND {
+            return Err(AppError::TokenVerificationFailed {
+                host: host.to_string(),
+                message: format!("Package owner '{username}' not found on {host}"),
+            });
+        }
+
         if !status.is_success() {
             let sanitized = read_and_sanitize_response(response, token);
             return Err(AppError::TokenVerificationFailed {
                 host: host.to_string(),
                 message: format!("HTTP {status}: {sanitized}"),
-            });
-        }
-
-        let body = response
-            .text()
-            .map_err(|e| AppError::TokenVerificationFailed {
-                host: host.to_string(),
-                message: format!("Failed reading response body: {e}"),
-            })?;
-
-        let user_info: UserResponse =
-            serde_json::from_str(&body).map_err(|e| AppError::TokenVerificationFailed {
-                host: host.to_string(),
-                message: format!("Failed to parse user profile: {e}"),
-            })?;
-
-        if !user_info.login.eq_ignore_ascii_case(username) {
-            return Err(AppError::TokenVerificationFailed {
-                host: host.to_string(),
-                message: format!(
-                    "Token belongs to user '{}', but login was requested for '{}'",
-                    user_info.login, username
-                ),
             });
         }
 
@@ -301,17 +279,17 @@ mod tests {
 
     #[test]
     fn test_pacman_repo_url_formatting() {
-        let url = pacman_repo_url("codeberg.org", "nathawat", "x86-64-v3", "x86_64_v3");
+        let url = pacman_repo_url("codeberg.org", "testuser", "x86-64-v3", "x86_64_v3");
         assert_eq!(
             url,
-            "https://codeberg.org/api/packages/nathawat/arch/x86-64-v3/x86_64_v3"
+            "https://codeberg.org/api/packages/testuser/arch/x86-64-v3/x86_64_v3"
         );
     }
 
     #[test]
     fn test_insecure_http_rejected() {
         let client = CodebergClient::new().unwrap();
-        let res = client.verify_token("http://codeberg.org", "nathawat", "secret_token");
+        let res = client.verify_token("http://codeberg.org", "testuser", "secret_token");
         assert!(
             matches!(res, Err(AppError::InsecureHttpRejected(url)) if url.starts_with("http://"))
         );
@@ -321,9 +299,9 @@ mod tests {
         std::fs::write(&pkg_file, b"data").unwrap();
         let res = client.upload_package(
             "http://codeberg.org",
-            "nathawat",
+            "testuser",
             "x86-64",
-            "nathawat",
+            "testuser",
             "secret_token",
             &pkg_file,
         );
@@ -332,19 +310,21 @@ mod tests {
         );
     }
 
-    // Helper to spin up a single-response mock HTTP server
-    fn run_mock_server(
-        status_line: &'static str,
-        body: &'static str,
-    ) -> (String, thread::JoinHandle<()>) {
+    type MockInspectReceiver = std::sync::mpsc::Receiver<(String, Vec<String>)>;
+    type MockServerResult = (String, MockInspectReceiver, thread::JoinHandle<()>);
+
+    fn run_mock_server_inspect(status_line: &'static str, body: &'static str) -> MockServerResult {
+        let (tx, rx) = std::sync::mpsc::channel();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut reader = BufReader::new(&mut stream);
+                let mut req_line = String::new();
+                let _ = reader.read_line(&mut req_line);
+                let mut headers = Vec::new();
                 let mut line = String::new();
                 let mut content_len = 0;
-                // Read request header lines until empty line
                 while let Ok(n) = reader.read_line(&mut line) {
                     if n == 0 || line == "\r\n" || line == "\n" {
                         break;
@@ -354,14 +334,14 @@ mod tests {
                     {
                         content_len = val.trim().parse::<usize>().unwrap_or(0);
                     }
+                    headers.push(line.trim_end().to_string());
                     line.clear();
                 }
-
-                // Drain body if any
                 if content_len > 0 {
                     let mut body_buf = vec![0u8; content_len];
                     let _ = reader.read_exact(&mut body_buf);
                 }
+                let _ = tx.send((req_line.trim_end().to_string(), headers));
 
                 let response = format!(
                     "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -373,7 +353,16 @@ mod tests {
             }
         });
 
-        (format!("http://127.0.0.1:{}", addr.port()), handle)
+        (format!("http://127.0.0.1:{}", addr.port()), rx, handle)
+    }
+
+    // Helper to spin up a single-response mock HTTP server
+    fn run_mock_server(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, thread::JoinHandle<()>) {
+        let (host, _rx, handle) = run_mock_server_inspect(status_line, body);
+        (host, handle)
     }
 
     #[test]
@@ -395,18 +384,50 @@ mod tests {
 
     #[test]
     fn test_mock_token_verify_success() {
-        let (host, handle) = run_mock_server("200 OK", r#"{"login":"nathawat"}"#);
+        let (host, rx, handle) = run_mock_server_inspect("200 OK", "[]");
         let client = CodebergClient::new_test_client().unwrap();
-        let res = client.verify_token(&host, "nathawat", "dummy_token");
+        let res = client.verify_token(&host, "testuser", "dummy_token");
         assert!(res.is_ok());
+        let (req_line, headers) = rx.recv().unwrap();
+        assert!(
+            req_line.starts_with("GET /api/v1/packages/testuser?limit=1"),
+            "Expected packages endpoint, got: {req_line}"
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|h| h.to_ascii_lowercase().starts_with("authorization: basic ")),
+            "Expected HTTP Basic authorization header"
+        );
         let _ = handle.join();
     }
 
     #[test]
-    fn test_mock_token_verify_username_mismatch() {
-        let (host, handle) = run_mock_server("200 OK", r#"{"login":"different_user"}"#);
+    fn test_verify_token_package_capable_without_read_user_scope() {
+        let (host, rx, handle) = run_mock_server_inspect("200 OK", "[]");
         let client = CodebergClient::new_test_client().unwrap();
-        let res = client.verify_token(&host, "nathawat", "dummy_token");
+        let res = client.verify_token(&host, "testuser", "scoped_or_unscoped_token");
+        assert!(
+            res.is_ok(),
+            "Verification must succeed with package-capable credentials"
+        );
+        let (req_line, _) = rx.recv().unwrap();
+        assert!(
+            !req_line.contains("/api/v1/user"),
+            "Must never request /api/v1/user: {req_line}"
+        );
+        assert!(
+            req_line.contains("/api/v1/packages/testuser"),
+            "Must target package registry: {req_line}"
+        );
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_mock_token_verify_owner_not_found() {
+        let (host, handle) = run_mock_server("404 Not Found", r#"{"message":"user not found"}"#);
+        let client = CodebergClient::new_test_client().unwrap();
+        let res = client.verify_token(&host, "nonexistent_user", "dummy_token");
         assert!(matches!(res, Err(AppError::TokenVerificationFailed { .. })));
         let _ = handle.join();
     }
@@ -416,7 +437,7 @@ mod tests {
         let (host, handle) =
             run_mock_server("401 Unauthorized", r#"{"message":"bad credentials"}"#);
         let client = CodebergClient::new_test_client().unwrap();
-        let res = client.verify_token(&host, "nathawat", "bad_token");
+        let res = client.verify_token(&host, "testuser", "bad_token");
         assert!(matches!(res, Err(AppError::AuthenticationRejected)));
         let _ = handle.join();
     }
@@ -431,9 +452,9 @@ mod tests {
         let client = CodebergClient::new_test_client().unwrap();
         let res = client.upload_package(
             &host,
-            "nathawat",
+            "testuser",
             "x86-64",
-            "nathawat",
+            "testuser",
             "dummy_token",
             &pkg_file,
         );
@@ -451,9 +472,9 @@ mod tests {
         let client = CodebergClient::new_test_client().unwrap();
         let res = client.upload_package(
             &host,
-            "nathawat",
+            "testuser",
             "x86-64",
-            "nathawat",
+            "testuser",
             "dummy_token",
             &pkg_file,
         );
@@ -477,9 +498,9 @@ mod tests {
         let client = CodebergClient::new_test_client().unwrap();
         let res = client.upload_package(
             &host,
-            "nathawat",
+            "testuser",
             "x86-64",
-            "nathawat",
+            "testuser",
             "dummy_token_secret_123",
             &pkg_file,
         );
@@ -501,9 +522,9 @@ mod tests {
         let client = CodebergClient::new_test_client().unwrap();
         let res = client.upload_package(
             &host,
-            "nathawat",
+            "testuser",
             "x86-64",
-            "nathawat",
+            "testuser",
             "dummy_token",
             &pkg_file,
         );

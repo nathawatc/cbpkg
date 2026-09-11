@@ -2,7 +2,33 @@ use crate::error::AppError;
 use crate::profile::TargetProfile;
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug)]
+pub struct StagedPackage {
+    pub staged_path: PathBuf,
+    pub target_group: String,
+    pub file_name: String,
+    _temp_dir: tempfile::TempDir,
+}
+
+impl StagedPackage {
+    pub fn stage(source_path: &Path, target_group: &str) -> Result<Self, AppError> {
+        let temp_dir = tempfile::tempdir().map_err(AppError::TempConfigCreate)?;
+        let file_name = source_path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| source_path.display().to_string());
+        let staged_path = temp_dir.path().join(&file_name);
+        std::fs::copy(source_path, &staged_path)?;
+        Ok(Self {
+            staged_path,
+            target_group: target_group.to_string(),
+            file_name,
+            _temp_dir: temp_dir,
+        })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedPackage {
@@ -284,5 +310,33 @@ mod tests {
         let v3 = TargetProfile::new(BuildProfile::V3, &cpu);
         let arch = validate_built_package(&archive_path, &v3).unwrap();
         assert_eq!(arch, "x86_64_v3");
+    }
+
+    #[test]
+    fn test_staged_package_raii_and_isolation() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let src_path = temp_dir.path().join("mypkg-1.0-1-any.pkg.tar.zst");
+        std::fs::write(&src_path, b"profile generic bytes").unwrap();
+
+        let staged = StagedPackage::stage(&src_path, "x86-64").unwrap();
+        assert_eq!(staged.file_name, "mypkg-1.0-1-any.pkg.tar.zst");
+        assert_eq!(staged.target_group, "x86-64");
+        assert!(staged.staged_path.is_file());
+        assert_eq!(
+            std::fs::read(&staged.staged_path).unwrap(),
+            b"profile generic bytes"
+        );
+
+        // Mutating or overwriting original source file must NOT alter staged copy
+        std::fs::write(&src_path, b"profile v3 bytes overwriting original").unwrap();
+        assert_eq!(
+            std::fs::read(&staged.staged_path).unwrap(),
+            b"profile generic bytes"
+        );
+
+        // RAII cleanup: when dropped, staged file and directory must be cleaned up
+        let staged_file_path = staged.staged_path.clone();
+        drop(staged);
+        assert!(!staged_file_path.exists());
     }
 }

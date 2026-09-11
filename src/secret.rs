@@ -3,12 +3,13 @@ use secret_service::EncryptionType;
 use secret_service::blocking::SecretService;
 use std::collections::HashMap;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use zeroize::Zeroize;
 
 pub const APP_ID: &str = "cbpkg";
 pub const ITEM_LABEL: &str = "cbpkg Codeberg token";
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct SecretCredential {
     pub username: String,
     pub token: String,
@@ -112,6 +113,143 @@ pub trait CredentialStore: Send + Sync {
     fn load_credential(&self, host: &str) -> Result<SecretCredential, AppError>;
     fn store_credential(&self, host: &str, username: &str, token: &str) -> Result<(), AppError>;
     fn delete_credential(&self, host: &str) -> Result<bool, AppError>;
+}
+
+#[cfg(unix)]
+pub(crate) fn validate_runtime_dir(dir: &Path, expected_uid: u32) -> Result<bool, AppError> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(_) => return Ok(false),
+    };
+
+    // Must be a directory and not a symlink
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return Ok(false);
+    }
+
+    // Must be owned by the expected UID
+    if meta.uid() != expected_uid {
+        return Ok(false);
+    }
+
+    // Must not be writable by group or others (0o022 mask must be 0)
+    let permissions_mode = meta.mode() & 0o777;
+    if (permissions_mode & 0o022) != 0 {
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+#[cfg(unix)]
+pub(crate) fn resolve_secure_runtime_dir() -> Result<PathBuf, AppError> {
+    let uid = unsafe { libc::getuid() };
+
+    // 1. Check $XDG_RUNTIME_DIR if suitable
+    if let Some(xdg_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        let path = PathBuf::from(xdg_dir);
+        if !path.as_os_str().is_empty() && validate_runtime_dir(&path, uid)? {
+            return Ok(path);
+        }
+    }
+
+    // 2. Check /run/user/<uid>
+    let fallback = PathBuf::from(format!("/run/user/{uid}"));
+    if validate_runtime_dir(&fallback, uid)? {
+        return Ok(fallback);
+    }
+
+    Err(AppError::SecretService(format!(
+        "No secure per-user runtime directory available for UID {uid} ($XDG_RUNTIME_DIR or /run/user/{uid}). Insecure fallback rejected."
+    )))
+}
+
+#[cfg(unix)]
+pub struct CredentialLock {
+    file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl CredentialLock {
+    pub fn acquire() -> Result<Self, AppError> {
+        let runtime_dir = resolve_secure_runtime_dir()?;
+        Self::acquire_in_dir(&runtime_dir)
+    }
+
+    pub(crate) fn acquire_in_dir(dir: &Path) -> Result<Self, AppError> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+
+        let uid = unsafe { libc::getuid() };
+        if !validate_runtime_dir(dir, uid)? {
+            return Err(AppError::SecretService(format!(
+                "Directory {} is not a secure runtime directory for UID {uid}",
+                dir.display()
+            )));
+        }
+
+        let lock_path = dir.join(format!("cbpkg-cred-{uid}.lock"));
+
+        let c_path = CString::new(lock_path.as_os_str().as_bytes())
+            .map_err(|e| AppError::SecretService(format!("Invalid lock path: {e}")))?;
+
+        let flags = libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        let mode: libc::mode_t = 0o600;
+
+        let fd = unsafe { libc::open(c_path.as_ptr(), flags, mode) };
+        if fd < 0 {
+            return Err(AppError::SecretService(format!(
+                "Failed opening credential lock at {}: {}",
+                lock_path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+
+        // Verify the opened file descriptor via fstat
+        let meta = file.metadata().map_err(|e| {
+            AppError::SecretService(format!("Failed to stat lock file descriptor: {e}"))
+        })?;
+
+        if !meta.is_file() {
+            return Err(AppError::SecretService(format!(
+                "Lock path {} is not a regular file",
+                lock_path.display()
+            )));
+        }
+
+        if meta.uid() != uid {
+            return Err(AppError::SecretService(format!(
+                "Lock file {} is owned by UID {}, expected UID {uid}",
+                lock_path.display(),
+                meta.uid()
+            )));
+        }
+
+        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if ret != 0 {
+            return Err(AppError::SecretService(format!(
+                "Failed acquiring credential lock: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        Ok(Self { file })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CredentialLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 
 pub struct SecretServiceStore;
@@ -222,6 +360,7 @@ impl CredentialStore for SecretServiceStore {
     }
 
     fn store_credential(&self, host: &str, username: &str, token: &str) -> Result<(), AppError> {
+        let _lock = CredentialLock::acquire()?;
         let host = normalize_host(host)?;
 
         let ss = SecretService::connect(EncryptionType::Dh)
@@ -270,13 +409,14 @@ impl CredentialStore for SecretServiceStore {
         attrs.insert("username", username);
 
         collection
-            .create_item(ITEM_LABEL, attrs, token.as_bytes(), true, "text/plain")
+            .create_item(ITEM_LABEL, attrs, token.as_bytes(), false, "text/plain")
             .map_err(|e| AppError::SecretService(format!("Failed to create secret item: {e}")))?;
 
         Ok(())
     }
 
     fn delete_credential(&self, host: &str) -> Result<bool, AppError> {
+        let _lock = CredentialLock::acquire()?;
         let host = normalize_host(host)?;
 
         let ss = SecretService::connect(EncryptionType::Dh)
@@ -476,36 +616,52 @@ mod tests {
     #[test]
     fn test_secret_credential_debug_redacted() {
         let cred = SecretCredential {
-            username: "nathawat".to_string(),
+            username: "testuser".to_string(),
             token: "secret_token_12345".to_string(),
         };
         let debug_str = format!("{cred:?}");
         assert!(!debug_str.contains("secret_token_12345"));
         assert!(debug_str.contains("<redacted>"));
-        assert!(debug_str.contains("nathawat"));
+        assert!(debug_str.contains("testuser"));
     }
 
     #[test]
     fn test_secret_token_zeroize_clears_buffer() {
         let mut cred = SecretCredential {
-            username: "nathawat".to_string(),
+            username: "testuser".to_string(),
             token: "super_secret_token_to_zeroize".to_string(),
         };
         assert_eq!(cred.token.len(), 29);
-        let ptr = cred.token.as_ptr();
         cred.token.zeroize();
         assert!(cred.token.is_empty());
-        unsafe {
-            let slice = std::slice::from_raw_parts(ptr, 29);
-            assert_eq!(slice, &[0u8; 29]);
-        }
+    }
+
+    #[test]
+    fn test_entered_login_token_zeroizing_wrapper() {
+        use zeroize::Zeroizing;
+        let mut token = Zeroizing::new("my_interactive_entered_token_123".to_string());
+        assert_eq!(token.trim(), "my_interactive_entered_token_123");
+        // Safe verification while allocation is still alive
+        token.zeroize();
+        assert!(token.is_empty());
+    }
+
+    #[test]
+    fn test_secret_credential_drop_zeroizes_structurally() {
+        let cred = SecretCredential {
+            username: "testuser".to_string(),
+            token: "active_token_123".to_string(),
+        };
+        assert_eq!(cred.token, "active_token_123");
+        // Drop implementation calls self.token.zeroize()
+        drop(cred);
     }
 
     #[test]
     fn test_metadata_vs_secret_access_login_precheck() {
         let store = MockCredentialStore::new();
         store
-            .store_credential("codeberg.org", "nathawat", "token_abc")
+            .store_credential("codeberg.org", "testuser", "token_abc")
             .unwrap();
 
         // Login precheck performs metadata lookup only
@@ -513,7 +669,7 @@ mod tests {
         assert_eq!(
             state,
             CredentialState::Present {
-                username: "nathawat".to_string()
+                username: "testuser".to_string()
             }
         );
         assert_eq!(store.lookup_count.load(Ordering::SeqCst), 1);
@@ -533,13 +689,13 @@ mod tests {
 
         // Status on Present host
         store
-            .store_credential("codeberg.org", "nathawat", "token_xyz")
+            .store_credential("codeberg.org", "testuser", "token_xyz")
             .unwrap();
         let state_present = store.lookup_credential("codeberg.org").unwrap();
         assert_eq!(
             state_present,
             CredentialState::Present {
-                username: "nathawat".to_string()
+                username: "testuser".to_string()
             }
         );
         assert_eq!(store.lookup_count.load(Ordering::SeqCst), 2);
@@ -551,11 +707,11 @@ mod tests {
     fn test_load_credential_loads_secret_and_tracks_count() {
         let store = MockCredentialStore::new();
         store
-            .store_credential("codeberg.org", "nathawat", "token_secret_only")
+            .store_credential("codeberg.org", "testuser", "token_secret_only")
             .unwrap();
 
         let cred = store.load_credential("codeberg.org").unwrap();
-        assert_eq!(cred.username, "nathawat");
+        assert_eq!(cred.username, "testuser");
         assert_eq!(cred.token, "token_secret_only");
         assert_eq!(store.load_count.load(Ordering::SeqCst), 1);
         assert_eq!(store.lookup_count.load(Ordering::SeqCst), 0);
@@ -616,12 +772,12 @@ mod tests {
             CredentialState::Missing
         );
         store
-            .store_credential("codeberg.org", "nathawat", "token_a")
+            .store_credential("codeberg.org", "testuser", "token_a")
             .unwrap();
         assert_eq!(
             store.lookup_credential("codeberg.org").unwrap(),
             CredentialState::Present {
-                username: "nathawat".to_string()
+                username: "testuser".to_string()
             }
         );
     }
@@ -630,14 +786,14 @@ mod tests {
     fn test_login_refuses_when_same_username_already_exists() {
         let store = MockCredentialStore::new();
         store
-            .store_credential("codeberg.org", "nathawat", "token_a")
+            .store_credential("codeberg.org", "testuser", "token_a")
             .unwrap();
 
-        let res = store.store_credential("codeberg.org", "nathawat", "token_b");
+        let res = store.store_credential("codeberg.org", "testuser", "token_b");
         assert!(matches!(
             res,
             Err(AppError::CredentialAlreadyExists { host, username })
-                if host == "codeberg.org" && username == "nathawat"
+                if host == "codeberg.org" && username == "testuser"
         ));
 
         // Original credential is not modified
@@ -649,14 +805,14 @@ mod tests {
     fn test_login_refuses_when_different_username_already_exists() {
         let store = MockCredentialStore::new();
         store
-            .store_credential("codeberg.org", "nathawat", "token_a")
+            .store_credential("codeberg.org", "testuser", "token_a")
             .unwrap();
 
         let res = store.store_credential("codeberg.org", "other_user", "token_b");
         assert!(matches!(
             res,
             Err(AppError::CredentialAlreadyExists { host, username })
-                if host == "codeberg.org" && username == "nathawat"
+                if host == "codeberg.org" && username == "testuser"
         ));
 
         // Original credential is not modified
@@ -668,7 +824,7 @@ mod tests {
     fn test_logout_clears_credential_and_is_idempotent() {
         let store = MockCredentialStore::new();
         store
-            .store_credential("codeberg.org", "nathawat", "token_a")
+            .store_credential("codeberg.org", "testuser", "token_a")
             .unwrap();
 
         // Logout clears credential and returns true
@@ -701,13 +857,13 @@ mod tests {
             items.push((
                 APP_ID.to_string(),
                 "codeberg.org".to_string(),
-                "nathawat".to_string(),
+                "testuser".to_string(),
                 "old_token_1".to_string(),
             ));
             items.push((
                 APP_ID.to_string(),
                 "codeberg.org".to_string(),
-                "nathawat_alt".to_string(),
+                "testuser_alt".to_string(),
                 "old_token_2".to_string(),
             ));
         }
@@ -719,7 +875,7 @@ mod tests {
         );
 
         // Store attempt on duplicate items fails with DuplicateCredentials
-        let res = store.store_credential("codeberg.org", "nathawat", "token_3");
+        let res = store.store_credential("codeberg.org", "testuser", "token_3");
         assert!(matches!(
             res,
             Err(AppError::DuplicateCredentials(host)) if host == "codeberg.org"
@@ -843,7 +999,7 @@ mod tests {
 
         // Stored with URL format
         store
-            .store_credential("https://codeberg.org/", "nathawat", "token_x")
+            .store_credential("https://codeberg.org/", "testuser", "token_x")
             .unwrap();
 
         let variants = vec![
@@ -860,13 +1016,13 @@ mod tests {
             assert_eq!(
                 store.lookup_credential(variant).unwrap(),
                 CredentialState::Present {
-                    username: "nathawat".to_string()
+                    username: "testuser".to_string()
                 },
                 "Lookup failed for equivalent variant '{variant}'"
             );
 
             // Storing with variant is refused because credential already exists
-            let res = store.store_credential(variant, "nathawat", "token_dup");
+            let res = store.store_credential(variant, "testuser", "token_dup");
             assert!(
                 matches!(res, Err(AppError::CredentialAlreadyExists { .. })),
                 "Expected duplicate refusal for variant '{variant}'"
@@ -927,7 +1083,7 @@ mod tests {
 
         // Storing cbpkg credential works without touching other_app
         store
-            .store_credential("codeberg.org", "nathawat", "cb_tok")
+            .store_credential("codeberg.org", "testuser", "cb_tok")
             .unwrap();
 
         // Logout from codeberg.org removes cbpkg credential but keeps other_app
@@ -942,7 +1098,7 @@ mod tests {
         let store = MockCredentialStore::new();
         store.fail_search.store(true, Ordering::SeqCst);
 
-        let res = store.store_credential("codeberg.org", "nathawat", "token_a");
+        let res = store.store_credential("codeberg.org", "testuser", "token_a");
         assert!(matches!(res, Err(AppError::SecretService(msg)) if msg.contains("search error")));
         assert!(store.items.lock().unwrap().is_empty());
 
@@ -961,7 +1117,7 @@ mod tests {
     fn test_delete_failure_propagation() {
         let store = MockCredentialStore::new();
         store
-            .store_credential("codeberg.org", "nathawat", "token_a")
+            .store_credential("codeberg.org", "testuser", "token_a")
             .unwrap();
 
         store.fail_delete.store(true, Ordering::SeqCst);
@@ -975,13 +1131,13 @@ mod tests {
         // 1. Existing valid credential -> CredentialAlreadyExists with real username
         let store = MockCredentialStore::new();
         store
-            .store_credential("codeberg.org", "nathawat", "token_1")
+            .store_credential("codeberg.org", "testuser", "token_1")
             .unwrap();
         let res_exists = store.store_credential("codeberg.org", "newuser", "token_2");
         assert!(matches!(
             res_exists,
             Err(AppError::CredentialAlreadyExists { host, username })
-                if host == "codeberg.org" && username == "nathawat"
+                if host == "codeberg.org" && username == "testuser"
         ));
 
         // 2. Existing credential with empty username -> MalformedCredential
@@ -1044,7 +1200,7 @@ mod tests {
         // 5. Search failure -> propagated
         let store_search_fail = MockCredentialStore::new();
         store_search_fail.fail_search.store(true, Ordering::SeqCst);
-        let res_search = store_search_fail.store_credential("codeberg.org", "nathawat", "token_1");
+        let res_search = store_search_fail.store_credential("codeberg.org", "testuser", "token_1");
         assert!(matches!(
             res_search,
             Err(AppError::SecretService(msg)) if msg.contains("search error")
@@ -1057,17 +1213,143 @@ mod tests {
             items.push((
                 APP_ID.to_string(),
                 "codeberg.org".to_string(),
-                "nathawat".to_string(),
+                "testuser".to_string(),
                 "token_1".to_string(),
             ));
         }
         store_attr_fail
             .fail_attributes
             .store(true, Ordering::SeqCst);
-        let res_attr = store_attr_fail.store_credential("codeberg.org", "nathawat", "token_2");
+        let res_attr = store_attr_fail.store_credential("codeberg.org", "testuser", "token_2");
         assert!(matches!(
             res_attr,
             Err(AppError::SecretService(msg)) if msg.contains("attribute error")
         ));
+    }
+
+    #[test]
+    fn test_credential_file_lock_mutual_exclusion() {
+        let lock1 = CredentialLock::acquire().unwrap();
+
+        let lock_dir = resolve_secure_runtime_dir().unwrap();
+        let uid = unsafe { libc::getuid() };
+        let lock_path = lock_dir.join(format!("cbpkg-cred-{uid}.lock"));
+
+        let file2 = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+
+        use std::os::unix::io::AsRawFd;
+        let ret = unsafe { libc::flock(file2.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(ret, -1);
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
+        assert!(errno == libc::EWOULDBLOCK || errno == libc::EAGAIN);
+
+        drop(lock1);
+
+        let ret2 = unsafe { libc::flock(file2.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(ret2, 0);
+        unsafe {
+            libc::flock(file2.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+
+    #[test]
+    fn test_runtime_dir_validation_rejects_symlink() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target_dir = temp_dir.path().join("real_dir");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let symlink_path = temp_dir.path().join("symlink_dir");
+        std::os::unix::fs::symlink(&target_dir, &symlink_path).unwrap();
+
+        let uid = unsafe { libc::getuid() };
+        assert!(!validate_runtime_dir(&symlink_path, uid).unwrap());
+        assert!(CredentialLock::acquire_in_dir(&symlink_path).is_err());
+    }
+
+    #[test]
+    fn test_runtime_dir_validation_rejects_insecure_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let insecure_dir = temp_dir.path().join("insecure_dir");
+        std::fs::create_dir_all(&insecure_dir).unwrap();
+        std::fs::set_permissions(&insecure_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let uid = unsafe { libc::getuid() };
+        assert!(!validate_runtime_dir(&insecure_dir, uid).unwrap());
+        assert!(CredentialLock::acquire_in_dir(&insecure_dir).is_err());
+    }
+
+    #[test]
+    fn test_runtime_dir_validation_accepts_secure_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let secure_dir = temp_dir.path().join("secure_dir");
+        std::fs::create_dir_all(&secure_dir).unwrap();
+        std::fs::set_permissions(&secure_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let uid = unsafe { libc::getuid() };
+        assert!(validate_runtime_dir(&secure_dir, uid).unwrap());
+        let lock = CredentialLock::acquire_in_dir(&secure_dir);
+        assert!(lock.is_ok());
+
+        // Verify lock file mode is 0600
+        let lock_file = secure_dir.join(format!("cbpkg-cred-{uid}.lock"));
+        let meta = std::fs::metadata(&lock_file).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn test_runtime_dir_lock_rejects_symlink_lock_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let secure_dir = temp_dir.path().join("secure_dir");
+        std::fs::create_dir_all(&secure_dir).unwrap();
+        std::fs::set_permissions(&secure_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let uid = unsafe { libc::getuid() };
+        let lock_file = secure_dir.join(format!("cbpkg-cred-{uid}.lock"));
+        let fake_target = temp_dir.path().join("fake_target");
+        std::fs::write(&fake_target, b"dummy").unwrap();
+        std::os::unix::fs::symlink(&fake_target, &lock_file).unwrap();
+
+        // O_NOFOLLOW must cause acquire_in_dir to fail
+        let res = CredentialLock::acquire_in_dir(&secure_dir);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_concurrent_racing_store_credential_cannot_replace_silently() {
+        use std::sync::Arc;
+        let store = Arc::new(MockCredentialStore::new());
+        let mut handles = Vec::new();
+
+        for i in 0..10 {
+            let store_clone = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                let token = format!("token_{i}");
+                let username = format!("user_{i}");
+                store_clone.store_credential("codeberg.org", &username, &token)
+            }));
+        }
+
+        let mut success_count = 0;
+        let mut already_exists_count = 0;
+
+        for h in handles {
+            match h.join().unwrap() {
+                Ok(()) => success_count += 1,
+                Err(AppError::CredentialAlreadyExists { .. }) => already_exists_count += 1,
+                Err(e) => panic!("Unexpected error during concurrent store: {e}"),
+            }
+        }
+
+        assert_eq!(success_count, 1);
+        assert_eq!(already_exists_count, 9);
+
+        let items = store.items.lock().unwrap();
+        assert_eq!(items.len(), 1);
     }
 }

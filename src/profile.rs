@@ -355,7 +355,7 @@ SRCEXT='.src.tar.gz'
 #########################################################################
 #
 #-- Command used to run pacman as root, instead of trying sudo and su
-#PACMAN_AUTH=()
+PACMAN_AUTH=(run0)
 {bridge}"#,
             profile = self.name(),
             arch_lines = arch_lines,
@@ -430,6 +430,7 @@ mod tests {
         assert!(makepkg_conf.contains(
             "OPTIONS=(strip docs !libtool !staticlibs emptydirs zipman purge !debug lto !autodeps)"
         ));
+        assert!(makepkg_conf.contains("PACMAN_AUTH=(run0)"));
         assert!(!makepkg_conf.contains("PKGDEST=/home/notroot/packages"));
 
         let rust_conf = target.render_rust_conf();
@@ -453,6 +454,7 @@ mod tests {
         assert!(target.rustflags().contains("target-cpu=x86-64-v3"));
 
         let makepkg_conf = target.render_makepkg_conf();
+        assert!(makepkg_conf.contains("PACMAN_AUTH=(run0)"));
         assert!(makepkg_conf.contains("PACKAGECARCH=\"x86_64_v3\""));
         assert!(makepkg_conf.contains("GOAMD64=v3"));
         assert!(makepkg_conf.contains("-march=x86-64-v3 -mtune=generic"));
@@ -478,6 +480,7 @@ mod tests {
         assert!(target.rustflags().contains("target-cpu=x86-64-v4"));
 
         let makepkg_conf = target.render_makepkg_conf();
+        assert!(makepkg_conf.contains("PACMAN_AUTH=(run0)"));
         assert!(makepkg_conf.contains("PACKAGECARCH=\"x86_64_v4\""));
         assert!(makepkg_conf.contains("GOAMD64=v4"));
         assert!(makepkg_conf.contains("-march=x86-64-v4 -mtune=generic"));
@@ -502,6 +505,7 @@ mod tests {
         assert!(target.rustflags().contains("target-cpu=native"));
 
         let makepkg_conf = target.render_makepkg_conf();
+        assert!(makepkg_conf.contains("PACMAN_AUTH=(run0)"));
         assert!(makepkg_conf.contains("PACKAGECARCH=\"x86_64_native\""));
         assert!(makepkg_conf.contains("-march=native -mtune=native"));
         assert!(makepkg_conf.contains("GOAMD64=v3"));

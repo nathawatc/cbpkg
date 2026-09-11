@@ -245,6 +245,7 @@ mod tests {
 
         assert_eq!(conf_path, temp_dir.path().join("makepkg.conf"));
         let makepkg_content = fs::read_to_string(&conf_path).unwrap();
+        assert!(makepkg_content.contains("PACMAN_AUTH=(run0)"));
         assert!(makepkg_content.contains("CARCH=\"x86_64\""));
         assert!(makepkg_content.contains("-march=x86-64 -mtune=generic"));
         assert!(!makepkg_content.contains("PACKAGECARCH"));
@@ -263,6 +264,7 @@ mod tests {
         let conf_path = setup_isolated_config(&target, temp_dir.path()).unwrap();
 
         let makepkg_content = fs::read_to_string(&conf_path).unwrap();
+        assert!(makepkg_content.contains("PACMAN_AUTH=(run0)"));
         assert!(makepkg_content.contains("PACKAGECARCH=\"x86_64_native\""));
         assert!(makepkg_content.contains("-march=native -mtune=native"));
         assert!(makepkg_content.contains("GOAMD64=v3"));
@@ -280,6 +282,7 @@ mod tests {
         let conf_path = setup_isolated_config(&target, temp_dir.path()).unwrap();
 
         let makepkg_content = fs::read_to_string(&conf_path).unwrap();
+        assert!(makepkg_content.contains("PACMAN_AUTH=(run0)"));
         assert!(makepkg_content.contains("PACKAGECARCH=\"x86_64_v3\""));
         assert!(makepkg_content.contains("-march=x86-64-v3 -mtune=generic"));
         assert!(makepkg_content.contains("-mpclmul"));

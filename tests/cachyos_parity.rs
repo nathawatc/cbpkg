@@ -174,6 +174,13 @@ fn assert_profile_pinned_parity(profile: BuildProfile, prefix: &str) {
             upstream_makepkg_vars.get("GOAMD64")
         );
     }
+
+    // Direct assertion: cbpkg policy must explicitly set PACMAN_AUTH=(run0)
+    assert!(makepkg_conf.contains("PACMAN_AUTH=(run0)"));
+    assert_eq!(
+        makepkg_vars.get("PACMAN_AUTH").map(String::as_str),
+        Some("(run0)")
+    );
 }
 
 #[test]
@@ -227,6 +234,10 @@ fn test_native_derived_parity() {
         normalize_ws(makepkg_vars.get("LDFLAGS").unwrap()),
         "-Wl,-O1 -Wl,--sort-common -Wl,--as-needed -Wl,-z,relro -Wl,-z,now -Wl,-z,pack-relative-relocs"
     );
+
+    // Direct assertion: cbpkg policy must explicitly set PACMAN_AUTH=(run0)
+    assert_eq!(makepkg_vars.get("PACMAN_AUTH").unwrap(), "(run0)");
+    assert!(makepkg_conf.contains("PACMAN_AUTH=(run0)"));
 }
 
 #[test]
@@ -254,7 +265,23 @@ fn test_exact_bidirectional_differences() {
         // Documented allowlist of intentional differences in variables:
         // 1. PKGDEST: Upstream sets /home/notroot/packages, cbpkg omits so packages build to current directory.
         // 2. LOGDEST: Upstream sets /home/notroot/packages, cbpkg omits so logs stay in current directory.
+        // 3. PACMAN_AUTH: cbpkg overrides upstream privilege escalation to use run0: PACMAN_AUTH=(run0).
+        //    Upstream CachyOS defaults to sudo or leaves it commented out.
         let allowed_omitted_in_cbpkg = ["PKGDEST", "LOGDEST"];
+        let allowed_divergent_vars = ["PACMAN_AUTH"];
+
+        // Direct assertion: cbpkg policy must explicitly set PACMAN_AUTH=(run0)
+        assert_eq!(
+            cbpkg_vars.get("PACMAN_AUTH").map(String::as_str),
+            Some("(run0)"),
+            "cbpkg must explicitly define PACMAN_AUTH=(run0) for profile {:?}",
+            profile
+        );
+        assert!(
+            makepkg_conf.contains("PACMAN_AUTH=(run0)"),
+            "cbpkg rendered makepkg config must contain PACMAN_AUTH=(run0) for profile {:?}",
+            profile
+        );
 
         // Check every variable in upstream: must either match cbpkg or be on allowlist
         for (key, upstream_val) in &upstream_vars {
@@ -262,6 +289,14 @@ fn test_exact_bidirectional_differences() {
                 assert!(
                     !cbpkg_vars.contains_key(key),
                     "cbpkg unexpectedly defined {key} in profile {:?}, but it should be omitted per allowlist",
+                    profile
+                );
+            } else if key == "PACMAN_AUTH" {
+                // Allowed intentional cbpkg divergence: cbpkg uses run0
+                assert_eq!(
+                    cbpkg_vars.get("PACMAN_AUTH").map(String::as_str),
+                    Some("(run0)"),
+                    "cbpkg PACMAN_AUTH must be (run0) for profile {:?}",
                     profile
                 );
             } else {
@@ -280,13 +315,22 @@ fn test_exact_bidirectional_differences() {
             }
         }
 
-        // Check every variable in cbpkg: must exist in upstream
+        // Check every variable in cbpkg: must exist in upstream OR be on allowed divergence list
         for key in cbpkg_vars.keys() {
-            assert!(
-                upstream_vars.contains_key(key),
-                "cbpkg defined unexpected variable {key} not present in upstream CachyOS for profile {:?}",
-                profile
-            );
+            if allowed_divergent_vars.contains(&key.as_str()) {
+                if key == "PACMAN_AUTH" {
+                    assert_eq!(
+                        cbpkg_vars.get("PACMAN_AUTH").map(String::as_str),
+                        Some("(run0)")
+                    );
+                }
+            } else {
+                assert!(
+                    upstream_vars.contains_key(key),
+                    "cbpkg defined unexpected variable {key} not present in upstream CachyOS for profile {:?}",
+                    profile
+                );
+            }
         }
 
         // Check documented structural differences:

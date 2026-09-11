@@ -275,6 +275,7 @@ name = "cbpkg"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "reqwest",
  "rpassword",
  "secret-service",

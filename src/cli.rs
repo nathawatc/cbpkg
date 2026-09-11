@@ -69,8 +69,8 @@ pub struct BuildArgs {
     pub host: String,
 
     /// Codeberg package owner / repository namespace
-    #[arg(long, default_value = "nathawat", env = "CODEBERG_OWNER")]
-    pub owner: String,
+    #[arg(long, env = "CODEBERG_OWNER")]
+    pub owner: Option<String>,
 
     /// Do not run makepkg with --syncdeps
     #[arg(long, default_value_t = false)]
@@ -91,4 +91,105 @@ pub struct BuildArgs {
     /// Pass --noconfirm to makepkg
     #[arg(long, default_value_t = false)]
     pub noconfirm: bool,
+}
+
+pub fn resolve_login_username<F>(
+    cli_user: Option<String>,
+    prompt_fn: F,
+) -> Result<String, crate::error::AppError>
+where
+    F: FnOnce() -> Result<String, crate::error::AppError>,
+{
+    match cli_user {
+        Some(u) => {
+            let trimmed = u.trim().to_string();
+            if trimmed.is_empty() {
+                return Err(crate::error::AppError::InputError(
+                    "Username cannot be empty".to_string(),
+                ));
+            }
+            Ok(trimmed)
+        }
+        None => {
+            let input = prompt_fn()?;
+            let trimmed = input.trim().to_string();
+            if trimmed.is_empty() {
+                return Err(crate::error::AppError::InputError(
+                    "Username cannot be empty".to_string(),
+                ));
+            }
+            Ok(trimmed)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::AppError;
+
+    #[test]
+    fn test_auth_login_cli_has_no_default_username() {
+        let cli = Cli::try_parse_from(["cbpkg", "auth", "login"]).unwrap();
+        match cli.command {
+            Some(Commands::Auth(AuthArgs {
+                command: AuthCommand::Login { username, .. },
+            })) => {
+                assert_eq!(
+                    username, None,
+                    "auth login must not have a default username"
+                );
+            }
+            other => panic!("Unexpected parsed command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_cli_has_no_default_owner() {
+        let cli = Cli::try_parse_from(["cbpkg", "build"]).unwrap();
+        match cli.command {
+            Some(Commands::Build(BuildArgs { owner, .. })) => {
+                assert_eq!(owner, None, "build must not have a hardcoded default owner");
+            }
+            other => panic!("Unexpected parsed command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_resolve_login_username_with_valid_explicit() {
+        let res = resolve_login_username(Some("  alice  ".to_string()), || unreachable!()).unwrap();
+        assert_eq!(res, "alice");
+    }
+
+    #[test]
+    fn test_resolve_login_username_with_blank_explicit_rejected() {
+        let res = resolve_login_username(Some("   ".to_string()), || unreachable!());
+        assert!(
+            matches!(res, Err(AppError::InputError(msg)) if msg.contains("Username cannot be empty"))
+        );
+
+        let res_empty = resolve_login_username(Some("".to_string()), || unreachable!());
+        assert!(
+            matches!(res_empty, Err(AppError::InputError(msg)) if msg.contains("Username cannot be empty"))
+        );
+    }
+
+    #[test]
+    fn test_resolve_login_username_with_valid_prompt() {
+        let res = resolve_login_username(None, || Ok("  bob  ".to_string())).unwrap();
+        assert_eq!(res, "bob");
+    }
+
+    #[test]
+    fn test_resolve_login_username_with_blank_prompt_rejected() {
+        let res = resolve_login_username(None, || Ok("   \n".to_string()));
+        assert!(
+            matches!(res, Err(AppError::InputError(msg)) if msg.contains("Username cannot be empty"))
+        );
+
+        let res_empty = resolve_login_username(None, || Ok("".to_string()));
+        assert!(
+            matches!(res_empty, Err(AppError::InputError(msg)) if msg.contains("Username cannot be empty"))
+        );
+    }
 }
