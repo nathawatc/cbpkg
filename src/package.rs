@@ -168,7 +168,7 @@ pub fn validate_built_package(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cpu::CpuFeatures;
+    use crate::cpu::mock::MockCpuIdProvider;
     use crate::profile::BuildProfile;
     use std::io::Write;
 
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn test_validate_planned_package_safety() {
-        let cpu = CpuFeatures::default();
+        let cpu = MockCpuIdProvider::default();
         let generic = TargetProfile::new(BuildProfile::Generic, &cpu);
         let v3 = TargetProfile::new(BuildProfile::V3, &cpu);
         let v4 = TargetProfile::new(BuildProfile::V4, &cpu);
@@ -280,7 +280,7 @@ mod tests {
 
         std::fs::write(&archive_path, compressed).unwrap();
 
-        let cpu = CpuFeatures::default();
+        let cpu = MockCpuIdProvider::default();
         let v3 = TargetProfile::new(BuildProfile::V3, &cpu);
         let arch = validate_built_package(&archive_path, &v3).unwrap();
         assert_eq!(arch, "x86_64_v3");

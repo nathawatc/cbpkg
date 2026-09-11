@@ -20,23 +20,46 @@ struct UserResponse {
 
 pub struct CodebergClient {
     client: Client,
+    allow_insecure_http: bool,
 }
 
 impl CodebergClient {
     pub fn new() -> Self {
+        Self::with_options(false)
+    }
+
+    fn with_options(allow_insecure_http: bool) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(300))
             .build()
             .unwrap_or_else(|_| Client::new());
-        Self { client }
+        Self {
+            client,
+            allow_insecure_http,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_test_client() -> Self {
+        Self::with_options(true)
+    }
+
+    fn normalize_endpoint(&self, host: &str) -> Result<String, AppError> {
+        let trimmed = host.trim().trim_end_matches('/');
+        if trimmed.starts_with("http://") {
+            if !self.allow_insecure_http {
+                return Err(AppError::InsecureHttpRejected(trimmed.to_string()));
+            }
+            Ok(trimmed.to_string())
+        } else if trimmed.starts_with("https://") {
+            Ok(trimmed.to_string())
+        } else {
+            Ok(format!("https://{trimmed}"))
+        }
     }
 
     pub fn verify_token(&self, host: &str, username: &str, token: &str) -> Result<(), AppError> {
-        let base = if host.starts_with("http://") || host.starts_with("https://") {
-            host.to_string()
-        } else {
-            format!("https://{host}")
-        };
+        let base = self.normalize_endpoint(host)?;
         let url = format!("{base}/api/v1/user");
         let response = self
             .client
@@ -54,10 +77,10 @@ impl CodebergClient {
         }
 
         if !status.is_success() {
-            let error_text = response.text().unwrap_or_default();
+            let sanitized = read_and_sanitize_response(response, token);
             return Err(AppError::TokenVerificationFailed {
                 host: host.to_string(),
-                message: format!("HTTP {status}: {}", sanitize_message(&error_text)),
+                message: format!("HTTP {status}: {sanitized}"),
             });
         }
 
@@ -101,27 +124,27 @@ impl CodebergClient {
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| pkg_path.display().to_string());
 
-        let base = if host.starts_with("http://") || host.starts_with("https://") {
-            host.to_string()
-        } else {
-            format!("https://{host}")
-        };
+        let base = self.normalize_endpoint(host)?;
         let url = format!("{base}/api/packages/{owner}/arch/{group}");
 
-        let mut file = File::open(pkg_path).map_err(|e| AppError::ProcessExecution {
-            cmd: format!("read package file {}", pkg_path.display()),
+        let file = File::open(pkg_path).map_err(|e| AppError::ProcessExecution {
+            cmd: format!("open package file {}", pkg_path.display()),
             source: e,
         })?;
 
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)?;
+        let metadata = file.metadata().map_err(|e| AppError::ProcessExecution {
+            cmd: format!("stat package file {}", pkg_path.display()),
+            source: e,
+        })?;
+        let file_len = metadata.len();
 
         let response = self
             .client
             .put(&url)
             .basic_auth(username, Some(token))
             .header("Content-Type", "application/octet-stream")
-            .body(buffer)
+            .header("Content-Length", file_len)
+            .body(file)
             .send()
             .map_err(|e| AppError::UploadFailed {
                 package: filename.clone(),
@@ -130,8 +153,7 @@ impl CodebergClient {
             })?;
 
         let status = response.status();
-        let body = response.text().unwrap_or_default();
-        let sanitized = sanitize_message(&body);
+        let sanitized = read_and_sanitize_response(response, token);
 
         match status {
             StatusCode::CREATED | StatusCode::OK | StatusCode::NO_CONTENT => {
@@ -155,22 +177,124 @@ impl Default for CodebergClient {
 }
 
 pub fn pacman_repo_url(host: &str, owner: &str, group: &str, arch: &str) -> String {
-    format!("https://{host}/api/packages/{owner}/arch/{group}/{arch}")
+    let clean_host = host
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    format!("https://{clean_host}/api/packages/{owner}/arch/{group}/{arch}")
 }
 
-fn sanitize_message(msg: &str) -> String {
-    let trimmed = msg.trim();
-    if trimmed.is_empty() {
-        "No response body from server".to_string()
+pub const MAX_ERROR_BODY_BYTES: usize = 1024;
+pub const MIN_LOOKAHEAD_BYTES: usize = 256;
+pub const MAX_LOOKAHEAD_BYTES: usize = 65536;
+
+pub fn read_and_sanitize_response<R: Read>(mut reader: R, token: &str) -> String {
+    let lookahead = if token.is_empty() {
+        MIN_LOOKAHEAD_BYTES
     } else {
-        trimmed.to_string()
+        token.len().clamp(MIN_LOOKAHEAD_BYTES, MAX_LOOKAHEAD_BYTES)
+    };
+    let max_read = MAX_ERROR_BODY_BYTES + lookahead + 1;
+    let mut buf = Vec::new();
+    let mut take_reader = (&mut reader).take(max_read as u64);
+    if take_reader.read_to_end(&mut buf).is_err() {
+        return "Failed to read response body".to_string();
     }
+    let had_overflow = buf.len() == max_read;
+    sanitize_error_bytes(&buf, token, had_overflow)
+}
+
+pub fn sanitize_error_bytes(bytes: &[u8], token: &str, stream_had_overflow: bool) -> String {
+    if bytes.is_empty() {
+        return "No response body from server".to_string();
+    }
+
+    // Convert valid UTF-8 portion of the entire read buffer (which contains lookahead)
+    let valid_str = match std::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            let valid_len = e.valid_up_to();
+            std::str::from_utf8(&bytes[..valid_len]).unwrap_or_default()
+        }
+    };
+
+    let trimmed = valid_str.trim();
+    if trimmed.is_empty() {
+        return "No response body from server".to_string();
+    }
+
+    // 1. Redact the active token on the whole buffer (includes lookahead to catch tokens crossing boundary)
+    let mut sanitized = trimmed.to_string();
+    if !token.is_empty() {
+        sanitized = sanitized.replace(token, "<redacted>");
+    }
+
+    // 2. Redact Authorization header lines if reflected
+    let lines: Vec<String> = sanitized
+        .lines()
+        .map(|line| {
+            let lower = line.to_ascii_lowercase();
+            if lower.contains("authorization:") {
+                "Authorization: <redacted>".to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    sanitized = lines.join("\n");
+
+    // 3. Determine whether the response was truncated
+    let is_truncated = stream_had_overflow
+        || bytes.len() > MAX_ERROR_BODY_BYTES
+        || sanitized.len() > MAX_ERROR_BODY_BYTES;
+
+    if is_truncated {
+        let mut cut_idx = MAX_ERROR_BODY_BYTES.min(sanitized.len());
+        while cut_idx > 0 && !sanitized.is_char_boundary(cut_idx) {
+            cut_idx -= 1;
+        }
+
+        // If truncation split the literal replacement "<redacted>", advance cut_idx to include it fully
+        for prefix_len in 1.."<redacted>".len() {
+            let prefix = &"<redacted>"[..prefix_len];
+            if sanitized[..cut_idx].ends_with(prefix) {
+                let suffix = &"<redacted>"[prefix_len..];
+                if sanitized[cut_idx..].starts_with(suffix) {
+                    cut_idx += suffix.len();
+                    break;
+                }
+            }
+        }
+
+        // If truncation split "Authorization: <redacted>", advance cut_idx to include it fully
+        let auth_redacted = "Authorization: <redacted>";
+        for prefix_len in 1..auth_redacted.len() {
+            let prefix = &auth_redacted[..prefix_len];
+            if sanitized[..cut_idx].ends_with(prefix) {
+                let suffix = &auth_redacted[prefix_len..];
+                if sanitized[cut_idx..].starts_with(suffix) {
+                    cut_idx += suffix.len();
+                    break;
+                }
+            }
+        }
+
+        sanitized.truncate(cut_idx);
+        sanitized.push_str(" ... [truncated]");
+    }
+
+    sanitized
+}
+
+pub fn sanitize_server_error(msg: &str, token: &str) -> String {
+    sanitize_error_bytes(msg.as_bytes(), token, false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::thread;
 
@@ -180,6 +304,30 @@ mod tests {
         assert_eq!(
             url,
             "https://codeberg.org/api/packages/nathawat/arch/x86-64-v3/x86_64_v3"
+        );
+    }
+
+    #[test]
+    fn test_insecure_http_rejected() {
+        let client = CodebergClient::new();
+        let res = client.verify_token("http://codeberg.org", "nathawat", "secret_token");
+        assert!(
+            matches!(res, Err(AppError::InsecureHttpRejected(url)) if url.starts_with("http://"))
+        );
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let pkg_file = temp_dir.path().join("pkg-1.0-1-x86_64.pkg.tar.zst");
+        std::fs::write(&pkg_file, b"data").unwrap();
+        let res = client.upload_package(
+            "http://codeberg.org",
+            "nathawat",
+            "x86-64",
+            "nathawat",
+            "secret_token",
+            &pkg_file,
+        );
+        assert!(
+            matches!(res, Err(AppError::InsecureHttpRejected(url)) if url.starts_with("http://"))
         );
     }
 
@@ -194,12 +342,24 @@ mod tests {
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut reader = BufReader::new(&mut stream);
                 let mut line = String::new();
+                let mut content_len = 0;
                 // Read request header lines until empty line
                 while let Ok(n) = reader.read_line(&mut line) {
                     if n == 0 || line == "\r\n" || line == "\n" {
                         break;
                     }
+                    if line.to_ascii_lowercase().starts_with("content-length:")
+                        && let Some(val) = line.split(':').nth(1)
+                    {
+                        content_len = val.trim().parse::<usize>().unwrap_or(0);
+                    }
                     line.clear();
+                }
+
+                // Drain body if any
+                if content_len > 0 {
+                    let mut body_buf = vec![0u8; content_len];
+                    let _ = reader.read_exact(&mut body_buf);
                 }
 
                 let response = format!(
@@ -218,7 +378,7 @@ mod tests {
     #[test]
     fn test_mock_token_verify_success() {
         let (host, handle) = run_mock_server("200 OK", r#"{"login":"nathawat"}"#);
-        let client = CodebergClient::new();
+        let client = CodebergClient::new_test_client();
         let res = client.verify_token(&host, "nathawat", "dummy_token");
         assert!(res.is_ok());
         let _ = handle.join();
@@ -227,7 +387,7 @@ mod tests {
     #[test]
     fn test_mock_token_verify_username_mismatch() {
         let (host, handle) = run_mock_server("200 OK", r#"{"login":"different_user"}"#);
-        let client = CodebergClient::new();
+        let client = CodebergClient::new_test_client();
         let res = client.verify_token(&host, "nathawat", "dummy_token");
         assert!(matches!(res, Err(AppError::TokenVerificationFailed { .. })));
         let _ = handle.join();
@@ -237,7 +397,7 @@ mod tests {
     fn test_mock_token_verify_unauthorized() {
         let (host, handle) =
             run_mock_server("401 Unauthorized", r#"{"message":"bad credentials"}"#);
-        let client = CodebergClient::new();
+        let client = CodebergClient::new_test_client();
         let res = client.verify_token(&host, "nathawat", "bad_token");
         assert!(matches!(res, Err(AppError::AuthenticationRejected)));
         let _ = handle.join();
@@ -250,7 +410,7 @@ mod tests {
         let pkg_file = temp_dir.path().join("pkg-1.0-1-x86_64.pkg.tar.zst");
         std::fs::write(&pkg_file, b"fake package data").unwrap();
 
-        let client = CodebergClient::new();
+        let client = CodebergClient::new_test_client();
         let res = client.upload_package(
             &host,
             "nathawat",
@@ -270,7 +430,7 @@ mod tests {
         let pkg_file = temp_dir.path().join("pkg-1.0-1-x86_64.pkg.tar.zst");
         std::fs::write(&pkg_file, b"fake package data").unwrap();
 
-        let client = CodebergClient::new();
+        let client = CodebergClient::new_test_client();
         let res = client.upload_package(
             &host,
             "nathawat",
@@ -287,13 +447,40 @@ mod tests {
     }
 
     #[test]
-    fn test_mock_upload_server_error_500() {
-        let (host, handle) = run_mock_server("500 Internal Server Error", "Database error");
+    fn test_mock_upload_server_error_500_with_redaction() {
+        let (host, handle) = run_mock_server(
+            "500 Internal Server Error",
+            "Database error for token dummy_token_secret_123 with Authorization: Basic secret",
+        );
         let temp_dir = tempfile::tempdir().unwrap();
         let pkg_file = temp_dir.path().join("pkg-1.0-1-x86_64.pkg.tar.zst");
         std::fs::write(&pkg_file, b"fake package data").unwrap();
 
-        let client = CodebergClient::new();
+        let client = CodebergClient::new_test_client();
+        let res = client.upload_package(
+            &host,
+            "nathawat",
+            "x86-64",
+            "nathawat",
+            "dummy_token_secret_123",
+            &pkg_file,
+        );
+        assert!(
+            matches!(res, Err(AppError::UploadFailed { ref message, .. }) if !message.contains("dummy_token_secret_123") && message.contains("<redacted>"))
+        );
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_mock_upload_streaming_large_file() {
+        let (host, handle) = run_mock_server("201 Created", "Package uploaded");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let pkg_file = temp_dir.path().join("big-1.0-1-x86_64.pkg.tar.zst");
+        // 1MB payload to test streaming
+        let payload = vec![0xABu8; 1024 * 1024];
+        std::fs::write(&pkg_file, &payload).unwrap();
+
+        let client = CodebergClient::new_test_client();
         let res = client.upload_package(
             &host,
             "nathawat",
@@ -302,15 +489,210 @@ mod tests {
             "dummy_token",
             &pkg_file,
         );
-        assert!(matches!(
-            res,
-            Err(AppError::UploadFailed { status: 500, .. })
-        ));
+        assert_eq!(res.unwrap(), UploadStatus::Success(201));
         let _ = handle.join();
     }
 
     #[test]
-    fn test_sanitize_message_empty() {
-        assert_eq!(sanitize_message("   "), "No response body from server");
+    fn test_sanitize_ascii_body_large() {
+        let big_error = "E".repeat(2048);
+        let sanitized = sanitize_server_error(&big_error, "tok");
+        assert!(sanitized.len() <= MAX_ERROR_BODY_BYTES + 30);
+        assert!(sanitized.ends_with(" ... [truncated]"));
+    }
+
+    #[test]
+    fn test_sanitize_thai_utf8_crossing_boundary() {
+        // "สวัสดีชาวโลก" is 36 UTF-8 bytes (12 chars * 3 bytes)
+        let thai_unit = "สวัสดีชาวโลก";
+        // Repeat to span across 1024 bytes
+        let thai_string = thai_unit.repeat(100);
+        assert!(thai_string.len() > 1024);
+
+        // Must not panic on UTF-8 boundary!
+        let sanitized = sanitize_server_error(&thai_string, "token123");
+        assert!(sanitized.ends_with(" ... [truncated]"));
+        // Assert that the entire string before truncation marker is valid UTF-8
+        let text_part = sanitized.strip_suffix(" ... [truncated]").unwrap();
+        assert!(!text_part.is_empty());
+    }
+
+    #[test]
+    fn test_sanitize_emoji_crossing_boundary() {
+        // Pad with ASCII so an emoji crosses offset 1024
+        // 1022 'A's followed by 4-byte 🦀 (bytes [0xF0, 0x9F, 0xA6, 0x80])
+        let mut bytes = vec![b'A'; 1022];
+        bytes.extend_from_slice("🦀🚀✨".as_bytes());
+        bytes.extend_from_slice(&[b'B'; 100]);
+
+        // Must not panic and must safely back off the split emoji
+        let sanitized = sanitize_error_bytes(&bytes, "my_token", false);
+        assert!(sanitized.ends_with(" ... [truncated]"));
+        let text_part = sanitized.strip_suffix(" ... [truncated]").unwrap();
+        assert_eq!(text_part.len(), 1022);
+        assert_eq!(text_part, &"A".repeat(1022));
+    }
+
+    #[test]
+    fn test_sanitize_token_before_truncation() {
+        let body_with_token = format!(
+            "Error: token=secret_token_12345 and details: {}",
+            "A".repeat(2000)
+        );
+        let sanitized = sanitize_server_error(&body_with_token, "secret_token_12345");
+        assert!(!sanitized.contains("secret_token_12345"));
+        assert!(sanitized.contains("<redacted>"));
+        assert!(sanitized.ends_with(" ... [truncated]"));
+    }
+
+    #[test]
+    fn test_sanitize_authorization_header_in_body() {
+        let body = "Error 401\nAuthorization: Bearer secret_header_value\nDetail: unauthorized";
+        let sanitized = sanitize_server_error(body, "other_token");
+        assert!(!sanitized.contains("secret_header_value"));
+        assert!(sanitized.contains("Authorization: <redacted>"));
+    }
+
+    #[test]
+    fn test_sanitize_empty_body() {
+        let sanitized = sanitize_server_error("", "token");
+        assert_eq!(sanitized, "No response body from server");
+
+        let sanitized_spaces = sanitize_server_error("   \n\t  ", "token");
+        assert_eq!(sanitized_spaces, "No response body from server");
+    }
+
+    #[test]
+    fn test_bounded_reader_does_not_exhaust_infinite_stream() {
+        // std::io::repeat is an infinite stream of 'X' bytes
+        let infinite = std::io::repeat(b'X');
+        let sanitized = read_and_sanitize_response(infinite, "my_token");
+        assert!(sanitized.len() <= MAX_ERROR_BODY_BYTES + 30);
+        assert!(sanitized.ends_with(" ... [truncated]"));
+    }
+
+    #[test]
+    fn test_token_entirely_before_boundary() {
+        let token = "SECRET_TOKEN_12345";
+        let body = format!("{} {} {}", "A".repeat(100), token, "B".repeat(2000));
+        let sanitized = read_and_sanitize_response(body.as_bytes(), token);
+        assert!(!sanitized.contains(token));
+        assert!(sanitized.contains("<redacted>"));
+        assert!(sanitized.ends_with(" ... [truncated]"));
+    }
+
+    #[test]
+    fn test_token_starts_exactly_at_boundary() {
+        let token = "SECRET_TOKEN_12345";
+        let body = format!("{}{}{}", "A".repeat(1024), token, "B".repeat(200));
+        let sanitized = read_and_sanitize_response(body.as_bytes(), token);
+        assert!(!sanitized.contains(token));
+        assert!(!sanitized.contains("SECRET"));
+        assert!(sanitized.ends_with(" ... [truncated]"));
+    }
+
+    #[test]
+    fn test_token_begins_before_boundary_and_ends_after_boundary() {
+        let token = "SECRET_TOKEN_12345";
+        // Token starts at byte 1020, spans past 1024
+        let body = format!("{}{}{}", "A".repeat(1020), token, "B".repeat(200));
+        let sanitized = read_and_sanitize_response(body.as_bytes(), token);
+
+        // Neither the full token nor the prefix "SECR" must appear
+        assert!(!sanitized.contains(token));
+        assert!(!sanitized.contains("SECR"));
+        assert!(!sanitized.contains("SECRET"));
+        assert!(sanitized.contains("<redacted>"));
+        assert!(sanitized.ends_with(" ... [truncated]"));
+    }
+
+    #[test]
+    fn test_only_1_byte_of_token_would_otherwise_be_visible_before_cutoff() {
+        let token = "SECRET_TOKEN_12345";
+        // Only 1 byte ('S') would land before 1024
+        let body = format!("{}{}{}", "A".repeat(1023), token, "B".repeat(200));
+        let sanitized = read_and_sanitize_response(body.as_bytes(), token);
+
+        assert!(!sanitized.contains(token));
+        assert!(!sanitized.contains("SECRET"));
+        // Confirm no dangling 'S' at the cutoff
+        let text_part = sanitized.strip_suffix(" ... [truncated]").unwrap();
+        assert!(!text_part.ends_with('S'));
+        assert!(sanitized.contains("<redacted>"));
+        assert!(sanitized.ends_with(" ... [truncated]"));
+    }
+
+    #[test]
+    fn test_multiple_token_occurrences() {
+        let token = "SECRET_TOKEN_12345";
+        let body = format!(
+            "{}{}{}{}{}",
+            token,
+            "A".repeat(500),
+            token,
+            "B".repeat(510),
+            token
+        );
+        let sanitized = read_and_sanitize_response(body.as_bytes(), token);
+        assert!(!sanitized.contains(token));
+        assert!(sanitized.contains("<redacted>"));
+        assert!(sanitized.ends_with(" ... [truncated]"));
+    }
+
+    #[test]
+    fn test_token_longer_than_diagnostic_limit() {
+        // Token is ~1500 bytes, larger than visible diagnostic limit (1024)
+        let token = format!("SECRET_LONG_{}_END", "X".repeat(1480));
+        assert_eq!(token.len(), 1496);
+
+        // Starts at offset 1000 in a 3000-byte stream
+        let body = format!("{}{}{}", "A".repeat(1000), token, "B".repeat(1000));
+        let sanitized = read_and_sanitize_response(body.as_bytes(), &token);
+
+        assert!(!sanitized.contains(&token));
+        assert!(!sanitized.contains("SECRET_LONG"));
+        assert!(sanitized.contains("<redacted>"));
+        assert!(sanitized.len() <= MAX_ERROR_BODY_BYTES + 30);
+        assert!(sanitized.ends_with(" ... [truncated]"));
+    }
+
+    #[test]
+    fn test_thai_adjacent_to_token_boundary() {
+        let token = "SECRET_TOKEN_12345";
+        // Thai characters (6 chars * 3 bytes = 18 bytes) immediately before boundary token
+        let thai = "สวัสดี";
+        // 1002 'A's + 18 bytes thai = 1020 bytes, so token starts at 1020 and crosses 1024
+        let body = format!("{}{}{}{}", "A".repeat(1002), thai, token, "B".repeat(200));
+        let sanitized = read_and_sanitize_response(body.as_bytes(), token);
+
+        assert!(!sanitized.contains(token));
+        assert!(!sanitized.contains("SECRET"));
+        assert!(sanitized.contains("<redacted>"));
+        assert!(sanitized.ends_with(" ... [truncated]"));
+    }
+
+    #[test]
+    fn test_emoji_adjacent_to_token_boundary() {
+        let token = "SECRET_TOKEN_12345";
+        let emoji = "🦀🚀🔥";
+        let body = format!("{}{}{}{}", "A".repeat(1010), emoji, token, "B".repeat(200));
+        let sanitized = read_and_sanitize_response(body.as_bytes(), token);
+
+        assert!(!sanitized.contains(token));
+        assert!(!sanitized.contains("SECRET"));
+        assert!(sanitized.contains("<redacted>"));
+        assert!(sanitized.ends_with(" ... [truncated]"));
+    }
+
+    #[test]
+    fn test_authorization_header_crossing_or_near_cutoff() {
+        let auth_header = "Authorization: Bearer super_secret_access_token_67890";
+        // Starts at offset 1010
+        let body = format!("{}\n{}\n{}", "A".repeat(1010), auth_header, "B".repeat(300));
+        let sanitized = read_and_sanitize_response(body.as_bytes(), "my_token");
+
+        assert!(!sanitized.contains("super_secret_access_token_67890"));
+        assert!(sanitized.contains("Authorization: <redacted>"));
+        assert!(sanitized.ends_with(" ... [truncated]"));
     }
 }

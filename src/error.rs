@@ -6,17 +6,8 @@ pub enum AppError {
     #[error("Missing required tool: makepkg not found in PATH")]
     MakepkgNotFound,
 
-    #[error("makepkg does not support PACKAGECARCH (required for optimized profile '{0}')")]
-    MakepkgMissingPackageCArch(String),
-
     #[error("PKGBUILD not found in directory: {0}")]
     PkgbuildNotFound(PathBuf),
-
-    #[error("Cannot read base makepkg config '{path}': {source}")]
-    BaseConfigUnreadable {
-        path: PathBuf,
-        source: std::io::Error,
-    },
 
     #[error("Failed to create temporary makepkg config: {0}")]
     TempConfigCreate(std::io::Error),
@@ -86,6 +77,14 @@ pub enum AppError {
         status: u16,
         message: String,
     },
+
+    #[error(
+        "Insecure HTTP URL rejected: '{0}'. Codeberg authentication and uploads require HTTPS."
+    )]
+    InsecureHttpRejected(String),
+
+    #[error("Selected profile '{profile}' is not executable on this build host:\n{reason}")]
+    HostArchitectureUnsupported { profile: String, reason: String },
 
     #[error("Interactive input error: {0}")]
     InputError(String),

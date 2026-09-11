@@ -44,7 +44,7 @@ impl Default for SecretServiceStore {
 
 impl CredentialStore for SecretServiceStore {
     fn get_credential(&self, host: &str) -> Result<Option<SecretCredential>, AppError> {
-        let ss = SecretService::connect(EncryptionType::Plain)
+        let ss = SecretService::connect(EncryptionType::Dh)
             .map_err(|e| AppError::SecretService(e.to_string()))?;
 
         let collection = ss.get_default_collection().map_err(|e| {
@@ -88,7 +88,7 @@ impl CredentialStore for SecretServiceStore {
     }
 
     fn store_credential(&self, host: &str, username: &str, token: &str) -> Result<(), AppError> {
-        let ss = SecretService::connect(EncryptionType::Plain)
+        let ss = SecretService::connect(EncryptionType::Dh)
             .map_err(|e| AppError::SecretService(e.to_string()))?;
 
         let collection = ss.get_default_collection().map_err(|e| {
@@ -99,15 +99,20 @@ impl CredentialStore for SecretServiceStore {
             .ensure_unlocked()
             .map_err(|_| AppError::CollectionLocked)?;
 
-        // Remove any existing cbpkg items for this host to prevent duplicate entries
+        // Search for existing cbpkg credentials and strictly propagate search errors
         let mut search_attrs = HashMap::new();
         search_attrs.insert("application", APP_ID);
         search_attrs.insert("host", host);
 
-        if let Ok(existing_items) = collection.search_items(search_attrs) {
-            for item in existing_items {
-                let _ = item.delete();
-            }
+        let existing_items = collection
+            .search_items(search_attrs)
+            .map_err(|e| AppError::SecretService(format!("Search existing items failed: {e}")))?;
+
+        // Delete all existing items deterministically and strictly propagate deletion errors
+        for item in existing_items {
+            item.delete().map_err(|e| {
+                AppError::SecretService(format!("Failed to delete existing item: {e}"))
+            })?;
         }
 
         let mut attrs = HashMap::new();
@@ -123,7 +128,7 @@ impl CredentialStore for SecretServiceStore {
     }
 
     fn delete_credential(&self, host: &str) -> Result<bool, AppError> {
-        let ss = SecretService::connect(EncryptionType::Plain)
+        let ss = SecretService::connect(EncryptionType::Dh)
             .map_err(|e| AppError::SecretService(e.to_string()))?;
 
         let collection = ss.get_default_collection().map_err(|e| {
@@ -158,10 +163,13 @@ impl CredentialStore for SecretServiceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[derive(Default)]
     pub struct MockCredentialStore {
-        entries: std::sync::Mutex<HashMap<(String, String), SecretCredential>>,
+        pub items: std::sync::Mutex<Vec<(String, String, String, String)>>,
+        pub fail_search: AtomicBool,
+        pub fail_delete: AtomicBool,
     }
 
     impl MockCredentialStore {
@@ -172,9 +180,21 @@ mod tests {
 
     impl CredentialStore for MockCredentialStore {
         fn get_credential(&self, host: &str) -> Result<Option<SecretCredential>, AppError> {
-            let map = self.entries.lock().unwrap();
-            let key = (APP_ID.to_string(), host.to_string());
-            Ok(map.get(&key).cloned())
+            if self.fail_search.load(Ordering::SeqCst) {
+                return Err(AppError::SecretService(
+                    "Simulated search error".to_string(),
+                ));
+            }
+            let items = self.items.lock().unwrap();
+            for (app, h, u, t) in items.iter() {
+                if app == APP_ID && h == host {
+                    return Ok(Some(SecretCredential {
+                        username: u.clone(),
+                        token: t.clone(),
+                    }));
+                }
+            }
+            Ok(None)
         }
 
         fn store_credential(
@@ -183,22 +203,44 @@ mod tests {
             username: &str,
             token: &str,
         ) -> Result<(), AppError> {
-            let mut map = self.entries.lock().unwrap();
-            let key = (APP_ID.to_string(), host.to_string());
-            map.insert(
-                key,
-                SecretCredential {
-                    username: username.to_string(),
-                    token: token.to_string(),
-                },
-            );
+            if self.fail_search.load(Ordering::SeqCst) {
+                return Err(AppError::SecretService(
+                    "Simulated search error".to_string(),
+                ));
+            }
+            if self.fail_delete.load(Ordering::SeqCst) {
+                return Err(AppError::SecretService(
+                    "Simulated delete error".to_string(),
+                ));
+            }
+
+            let mut items = self.items.lock().unwrap();
+            items.retain(|(app, h, _, _)| !(app == APP_ID && h == host));
+            items.push((
+                APP_ID.to_string(),
+                host.to_string(),
+                username.to_string(),
+                token.to_string(),
+            ));
             Ok(())
         }
 
         fn delete_credential(&self, host: &str) -> Result<bool, AppError> {
-            let mut map = self.entries.lock().unwrap();
-            let key = (APP_ID.to_string(), host.to_string());
-            Ok(map.remove(&key).is_some())
+            if self.fail_search.load(Ordering::SeqCst) {
+                return Err(AppError::SecretService(
+                    "Simulated search error".to_string(),
+                ));
+            }
+            if self.fail_delete.load(Ordering::SeqCst) {
+                return Err(AppError::SecretService(
+                    "Simulated delete error".to_string(),
+                ));
+            }
+
+            let mut items = self.items.lock().unwrap();
+            let before = items.len();
+            items.retain(|(app, h, _, _)| !(app == APP_ID && h == host));
+            Ok(items.len() < before)
         }
     }
 
@@ -215,35 +257,128 @@ mod tests {
     }
 
     #[test]
-    fn test_mock_credential_store_workflow() {
+    fn test_credential_replacement() {
         let store = MockCredentialStore::new();
 
-        // 1. Initial status: not found
-        assert_eq!(store.get_credential("codeberg.org").unwrap(), None);
-
-        // 2. Store credential
         store
             .store_credential("codeberg.org", "nathawat", "token_a")
             .unwrap();
-        let cred = store.get_credential("codeberg.org").unwrap().unwrap();
-        assert_eq!(cred.username, "nathawat");
-        assert_eq!(cred.token, "token_a");
+        let cred1 = store.get_credential("codeberg.org").unwrap().unwrap();
+        assert_eq!(cred1.token, "token_a");
 
-        // 3. Replacement of existing credential
         store
             .store_credential("codeberg.org", "nathawat", "token_b")
             .unwrap();
         let cred2 = store.get_credential("codeberg.org").unwrap().unwrap();
         assert_eq!(cred2.token, "token_b");
 
-        // 4. Scoped isolation: different host not affected
-        assert_eq!(store.get_credential("other.org").unwrap(), None);
+        let items = store.items.lock().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].3, "token_b");
+    }
 
-        // 5. Delete credential
+    #[test]
+    fn test_search_failure_propagation() {
+        let store = MockCredentialStore::new();
+        store.fail_search.store(true, Ordering::SeqCst);
+
+        let res = store.store_credential("codeberg.org", "nathawat", "token_a");
+        assert!(matches!(res, Err(AppError::SecretService(msg)) if msg.contains("search error")));
+        assert!(store.items.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_delete_failure_propagation() {
+        let store = MockCredentialStore::new();
+        store
+            .store_credential("codeberg.org", "nathawat", "token_a")
+            .unwrap();
+
+        store.fail_delete.store(true, Ordering::SeqCst);
+
+        let res = store.store_credential("codeberg.org", "nathawat", "token_b");
+        assert!(matches!(res, Err(AppError::SecretService(msg)) if msg.contains("delete error")));
+
+        // Token_a was not overwritten or removed
+        let cred = store.get_credential("codeberg.org").unwrap().unwrap();
+        assert_eq!(cred.token, "token_a");
+    }
+
+    #[test]
+    fn test_duplicate_handling() {
+        let store = MockCredentialStore::new();
+        // Artificially inject multiple cbpkg duplicate entries for the host
+        {
+            let mut items = store.items.lock().unwrap();
+            items.push((
+                APP_ID.to_string(),
+                "codeberg.org".to_string(),
+                "nathawat".to_string(),
+                "old_token_1".to_string(),
+            ));
+            items.push((
+                APP_ID.to_string(),
+                "codeberg.org".to_string(),
+                "nathawat".to_string(),
+                "old_token_2".to_string(),
+            ));
+        }
+
+        // Store new credential
+        store
+            .store_credential("codeberg.org", "nathawat", "new_token")
+            .unwrap();
+
+        let items = store.items.lock().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].3, "new_token");
+    }
+
+    #[test]
+    fn test_logout_isolation() {
+        let store = MockCredentialStore::new();
+        {
+            let mut items = store.items.lock().unwrap();
+            items.push((
+                "other_app".to_string(),
+                "codeberg.org".to_string(),
+                "user_other".to_string(),
+                "token_other".to_string(),
+            ));
+            items.push((
+                APP_ID.to_string(),
+                "gitlab.com".to_string(),
+                "user_gitlab".to_string(),
+                "token_gitlab".to_string(),
+            ));
+            items.push((
+                APP_ID.to_string(),
+                "codeberg.org".to_string(),
+                "nathawat".to_string(),
+                "token_codeberg".to_string(),
+            ));
+        }
+
+        // Logout from codeberg.org
         assert!(store.delete_credential("codeberg.org").unwrap());
-        assert_eq!(store.get_credential("codeberg.org").unwrap(), None);
 
-        // 6. Delete idempotent (returns false when not present)
-        assert!(!store.delete_credential("codeberg.org").unwrap());
+        // Verify other app and other host were not deleted
+        let items = store.items.lock().unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(
+            items
+                .iter()
+                .any(|(app, h, _, _)| app == "other_app" && h == "codeberg.org")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|(app, h, _, _)| app == APP_ID && h == "gitlab.com")
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|(app, h, _, _)| app == APP_ID && h == "codeberg.org")
+        );
     }
 }

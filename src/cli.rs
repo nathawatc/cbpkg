@@ -1,5 +1,4 @@
 use clap::{Args, Parser, Subcommand};
-use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -64,10 +63,6 @@ pub struct BuildArgs {
     /// Upload successfully built packages to Codeberg Packages
     #[arg(long, default_value_t = false)]
     pub upload: bool,
-
-    /// Base makepkg configuration file
-    #[arg(long, env = "MAKEPKG_BASE_CONFIG", default_value = "/etc/makepkg.conf")]
-    pub base_config: PathBuf,
 
     /// Codeberg host
     #[arg(long, default_value = "codeberg.org", env = "CODEBERG_HOST")]

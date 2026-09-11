@@ -1,24 +1,14 @@
-mod cli;
-mod codeberg;
-mod cpu;
-mod error;
-mod makepkg;
-mod package;
-mod profile;
-mod secret;
-
-use clap::{CommandFactory, Parser};
-use cli::{AuthArgs, AuthCommand, BuildArgs, Cli, Commands};
-use codeberg::{CodebergClient, UploadStatus, pacman_repo_url};
-use cpu::CpuFeatures;
-use error::AppError;
-use makepkg::{
-    MakepkgBuildOptions, check_makepkg_supports_packagecarch, execute_build, find_makepkg,
-    generate_makepkg_config, get_planned_packages,
+use cbpkg::cli::{AuthArgs, AuthCommand, BuildArgs, Cli, Commands};
+use cbpkg::codeberg::{CodebergClient, UploadStatus, pacman_repo_url};
+use cbpkg::cpu::{HostCpuIdProvider, validate_host_for_profile};
+use cbpkg::error::AppError;
+use cbpkg::makepkg::{
+    MakepkgBuildOptions, execute_build, find_makepkg, get_planned_packages, setup_isolated_config,
 };
-use package::{validate_built_package, validate_planned_package};
-use profile::{BuildProfile, TargetProfile};
-use secret::{CredentialStore, SecretServiceStore};
+use cbpkg::package::{validate_built_package, validate_planned_package};
+use cbpkg::profile::{BuildProfile, TargetProfile};
+use cbpkg::secret::{CredentialStore, SecretServiceStore};
+use clap::{CommandFactory, Parser};
 use std::io::{self, BufRead, Write};
 
 fn main() {
@@ -113,26 +103,24 @@ fn handle_build(args: BuildArgs) -> Result<(), AppError> {
         return Err(AppError::PkgbuildNotFound(working_dir));
     }
 
-    if !args.base_config.is_file() {
-        return Err(AppError::BaseConfigUnreadable {
-            path: args.base_config.clone(),
-            source: io::Error::new(io::ErrorKind::NotFound, "File does not exist"),
-        });
-    }
-
     let makepkg_path = find_makepkg()?;
-    let host_features = CpuFeatures::from_host()?;
+    let cpu_provider = HostCpuIdProvider::new();
 
     let (selected_profiles, upload_enabled) = if let Some(ref profile_str) = args.profile {
         let profiles = parse_cli_profiles(profile_str)?;
         (profiles, args.upload)
     } else {
-        interactive_prompt(&args, &host_features)?
+        interactive_prompt(&args)?
     };
 
     if selected_profiles.is_empty() {
         println!("No profiles selected. Exiting.");
         return Ok(());
+    }
+
+    // Host architecture preflight for selected profiles
+    for profile in &selected_profiles {
+        validate_host_for_profile(&cpu_provider, profile.as_str())?;
     }
 
     // Verify authentication BEFORE build if upload is requested
@@ -146,16 +134,6 @@ fn handle_build(args: BuildArgs) -> Result<(), AppError> {
         None
     };
 
-    // Safety check: if any profile is optimized, verify makepkg supports PACKAGECARCH
-    let has_optimized = selected_profiles
-        .iter()
-        .any(|p| *p != BuildProfile::Generic);
-    if has_optimized && !check_makepkg_supports_packagecarch(&makepkg_path)? {
-        return Err(AppError::MakepkgMissingPackageCArch(
-            "Installed makepkg does not support PACKAGECARCH".to_string(),
-        ));
-    }
-
     let build_options = MakepkgBuildOptions {
         syncdeps: !args.no_syncdeps,
         clean: !args.no_clean,
@@ -168,7 +146,7 @@ fn handle_build(args: BuildArgs) -> Result<(), AppError> {
     let mut upload_errors = Vec::new();
 
     for profile in selected_profiles {
-        let target = TargetProfile::new(profile, &host_features);
+        let target = TargetProfile::new(profile, &cpu_provider);
 
         println!();
         println!("\x1b[1;34m==>\x1b[0m Profile: {}", target.name());
@@ -185,24 +163,21 @@ fn handle_build(args: BuildArgs) -> Result<(), AppError> {
             "\x1b[1;34m==>\x1b[0m Codeberg group: {}",
             target.codeberg_group()
         );
-        if target.profile == BuildProfile::Native {
-            println!(
-                "\x1b[1;34m==>\x1b[0m Detected Go microarchitecture level: {}",
-                target.goamd64_str()
-            );
+        if target.profile == BuildProfile::Native
+            && let Some(goamd64) = target.goamd64_str()
+        {
+            println!("\x1b[1;34m==>\x1b[0m Detected Go microarchitecture level: {goamd64}");
         }
 
         // 1. Create isolated temporary directory
         let temp_dir = tempfile::tempdir().map_err(AppError::TempConfigCreate)?;
-        let temp_conf_path = temp_dir
-            .path()
-            .join(format!("makepkg-{}.conf", target.name()));
 
-        // 2. Produce profile-specific configuration
-        generate_makepkg_config(&args.base_config, &target, &temp_conf_path)?;
+        // 2. Setup isolated configuration (makepkg.conf and makepkg.conf.d/rust.conf)
+        let temp_conf_path = setup_isolated_config(&target, temp_dir.path())?;
 
         // 3 & 4. Determine planned outputs
-        let planned_pkgs = get_planned_packages(&makepkg_path, &temp_conf_path, &working_dir)?;
+        let planned_pkgs =
+            get_planned_packages(&makepkg_path, &temp_conf_path, &working_dir, &target)?;
 
         println!("\x1b[1;34m==>\x1b[0m Planned package output:");
         for pkg in &planned_pkgs {
@@ -215,7 +190,13 @@ fn handle_build(args: BuildArgs) -> Result<(), AppError> {
         }
 
         // 6. Run actual build through makepkg
-        execute_build(&makepkg_path, &temp_conf_path, &working_dir, &build_options)?;
+        execute_build(
+            &makepkg_path,
+            &temp_conf_path,
+            &working_dir,
+            &build_options,
+            &target,
+        )?;
 
         // 7 & 8. Validate output existence and .PKGINFO metadata
         for pkg in &planned_pkgs {
@@ -304,14 +285,7 @@ fn parse_cli_profiles(s: &str) -> Result<Vec<BuildProfile>, AppError> {
     }
 }
 
-fn interactive_prompt(
-    args: &BuildArgs,
-    _host_features: &CpuFeatures,
-) -> Result<(Vec<BuildProfile>, bool), AppError> {
-    println!(
-        "\x1b[1;34m==>\x1b[0m Base makepkg config: {}",
-        args.base_config.display()
-    );
+fn interactive_prompt(args: &BuildArgs) -> Result<(Vec<BuildProfile>, bool), AppError> {
     println!("\x1b[1;34m==>\x1b[0m Codeberg owner: {}", args.owner);
     println!();
     println!("Select build profile:");
