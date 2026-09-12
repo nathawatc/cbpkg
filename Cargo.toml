@@ -2,6 +2,17 @@
 name = "cbpkg"
 version = "0.1.0"
 edition = "2024"
+description = "Tool for building Arch Linux packages and publishing to Codeberg Packages"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/nathawatc/cbpkg"
+keywords = ["archlinux", "makepkg", "packaging", "codeberg", "build-tool"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
 
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }
