@@ -24,7 +24,7 @@ Runtime requirements:
 - `run0` when dependency installation through `makepkg --syncdeps` is enabled
 - the tools and build dependencies required by the target `PKGBUILD`
 
-For Codeberg authentication, a Linux D-Bus Secret Service are also required.
+For Codeberg authentication, a Linux D-Bus Secret Service is also required.
 
 To build `cbpkg` itself, install a current Rust toolchain with Cargo.
 
