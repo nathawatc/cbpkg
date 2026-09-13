@@ -25,6 +25,7 @@ impl CodebergClient {
     fn with_options(allow_insecure_http: bool) -> Result<Self, AppError> {
         let client = Client::builder()
             .timeout(Duration::from_secs(300))
+            .https_only(!allow_insecure_http)
             .build()
             .map_err(|e| AppError::HttpClientInit(e.to_string()))?;
         Ok(Self {
@@ -209,12 +210,14 @@ pub fn sanitize_error_bytes(bytes: &[u8], token: &str, stream_had_overflow: bool
         sanitized = sanitized.replace(token, "<redacted>");
     }
 
-    // 2. Redact Authorization header lines if reflected
+    // 2. Redact any reflected Authorization field/header line. This intentionally
+    // fails closed for JSON and other formats where punctuation may appear between
+    // the field name and ':' (for example, `"Authorization":"Basic ..."`).
     let lines: Vec<String> = sanitized
         .lines()
         .map(|line| {
             let lower = line.to_ascii_lowercase();
-            if lower.contains("authorization:") {
+            if lower.contains("authorization") {
                 "Authorization: <redacted>".to_string()
             } else {
                 line.to_string()
@@ -308,6 +311,17 @@ mod tests {
         assert!(
             matches!(res, Err(AppError::InsecureHttpRejected(url)) if url.starts_with("http://"))
         );
+    }
+
+    #[test]
+    fn test_production_http_client_enforces_https_transport() {
+        let client = CodebergClient::new().unwrap();
+        let err = client
+            .client
+            .get("http://127.0.0.1:1/transport-bypass")
+            .send()
+            .unwrap_err();
+        assert!(err.is_builder(), "expected HTTPS-only builder error: {err}");
     }
 
     type MockInspectReceiver = std::sync::mpsc::Receiver<(String, Vec<String>)>;
@@ -590,6 +604,28 @@ mod tests {
         let sanitized = sanitize_server_error(body, "other_token");
         assert!(!sanitized.contains("secret_header_value"));
         assert!(sanitized.contains("Authorization: <redacted>"));
+    }
+
+    #[test]
+    fn test_sanitize_json_authorization_field() {
+        let encoded_basic = "dGVzdHVzZXI6c2VjcmV0X3Rva2VuXzEyMw==";
+        let body = format!(r#"{{"Authorization":"Basic {encoded_basic}"}}"#);
+        let sanitized = sanitize_server_error(&body, "secret_token_123");
+        assert!(!sanitized.contains(encoded_basic));
+        assert_eq!(sanitized, "Authorization: <redacted>");
+    }
+
+    #[test]
+    fn test_sanitize_json_authorization_near_truncation_boundary() {
+        let encoded_basic = "dGVzdHVzZXI6c2VjcmV0X3Rva2VuXzEyMw==";
+        let body = format!(
+            r#"{}{{"Authorization":"Basic {encoded_basic}"}}"#,
+            "A".repeat(MAX_ERROR_BODY_BYTES - 24)
+        );
+        let sanitized = read_and_sanitize_response(body.as_bytes(), "secret_token_123");
+        assert!(!sanitized.contains(encoded_basic));
+        assert!(sanitized.contains("Authorization: <redacted>"));
+        assert!(sanitized.ends_with(" ... [truncated]"));
     }
 
     #[test]
